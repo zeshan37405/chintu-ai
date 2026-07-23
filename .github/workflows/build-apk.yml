@@ -4,6 +4,8 @@ on:
   workflow_dispatch:
   push:
     branches: ["main"]
+  pull_request:
+    branches: ["main"]
 
 concurrency:
   group: chintu-android-${{ github.ref }}
@@ -35,11 +37,8 @@ jobs:
         with:
           gradle-version: "9.5.0"
 
-      - name: Run Android lint
-        run: gradle lintDebug --stacktrace
-
-      - name: Build debug APK
-        run: gradle assembleDebug --stacktrace
+      - name: Validate and build APK
+        run: gradle lintDebug assembleDebug --stacktrace --no-daemon
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
