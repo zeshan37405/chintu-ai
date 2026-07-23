@@ -2,6 +2,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
 
     <queries>
         <package android:name="com.google.android.youtube" />
@@ -9,13 +10,20 @@
         <package android:name="com.whatsapp.w4b" />
         <package android:name="com.instagram.android" />
         <package android:name="com.facebook.katana" />
+        <package android:name="com.facebook.lite" />
         <package android:name="com.facebook.orca" />
         <package android:name="com.zhiliaoapp.musically" />
+        <package android:name="com.ss.android.ugc.trill" />
         <package android:name="com.twitter.android" />
         <package android:name="com.google.android.gm" />
         <package android:name="com.google.android.apps.maps" />
         <package android:name="com.google.android.apps.photos" />
+        <package android:name="com.miui.gallery" />
+        <package android:name="com.miui.calculator" />
+        <package android:name="com.google.android.calculator" />
         <package android:name="com.android.chrome" />
+        <package android:name="com.mi.globalbrowser" />
+        <package android:name="com.android.browser" />
 
         <intent>
             <action android:name="android.media.action.IMAGE_CAPTURE" />
@@ -27,6 +35,9 @@
         <intent>
             <action android:name="android.intent.action.SENDTO" />
             <data android:scheme="smsto" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.WEB_SEARCH" />
         </intent>
     </queries>
 
