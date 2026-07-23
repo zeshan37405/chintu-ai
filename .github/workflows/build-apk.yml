@@ -5,9 +5,14 @@ on:
   push:
     branches: ["main"]
 
+concurrency:
+  group: chintu-android-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
@@ -30,6 +35,9 @@ jobs:
         with:
           gradle-version: "9.5.0"
 
+      - name: Run Android lint
+        run: gradle lintDebug --stacktrace
+
       - name: Build debug APK
         run: gradle assembleDebug --stacktrace
 
@@ -38,3 +46,14 @@ jobs:
         with:
           name: chintu-ai-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload lint report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chintu-ai-lint-report
+          path: app/build/reports/lint-results-debug.html
+          if-no-files-found: ignore
+          retention-days: 14
