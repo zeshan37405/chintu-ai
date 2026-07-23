@@ -10,8 +10,8 @@ android {
         applicationId 'com.zeshan.chintuai'
         minSdk 26
         targetSdk 36
-        versionCode 7
-        versionName '1.0.1'
+        versionCode 8
+        versionName '2.0.0'
     }
 
     compileOptions {
@@ -22,13 +22,16 @@ android {
     lint {
         abortOnError true
         checkReleaseBuilds true
+        warningsAsErrors false
     }
 
     buildTypes {
         debug {
             debuggable true
+            minifyEnabled false
         }
         release {
+            debuggable false
             minifyEnabled false
         }
     }
