@@ -1,11 +1,14 @@
 package com.zeshan.chintuai;
 
 import android.Manifest;
+import android.annotation.SuppressLint;
+import android.app.ActivityManager;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -17,6 +20,7 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.os.ResultReceiver;
 import android.os.SystemClock;
 import android.speech.RecognitionListener;
 import android.speech.RecognizerIntent;
@@ -27,16 +31,15 @@ import android.speech.tts.UtteranceProgressListener;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.Locale;
 
 /**
- * Redmi-safe hands-free service.
+ * ANR-safe hands-free voice service for Redmi/HyperOS.
  *
- * Some Xiaomi recognition services accept an injected AudioRecord stream but never emit words,
- * leaving the UI apparently active forever. This implementation deliberately uses the platform
- * recognizer's own microphone, rotates Urdu/Indian language models, and renews the recognition
- * session every eighteen seconds while keeping the visible owner-lock state stable.
+ * The service runs in its own process. A slow Xiaomi speech or TTS binder therefore cannot block
+ * the visible Chintu activity. One SpeechRecognizer instance is reused instead of being destroyed
+ * and recreated every few seconds. Recognized commands are executed in the main process through
+ * CommandExecutionReceiver so Accessibility controls continue to work.
  */
 public final class HandsFreeVoiceService extends Service
         implements RecognitionListener, TextToSpeech.OnInitListener {
@@ -55,11 +58,15 @@ public final class HandsFreeVoiceService extends Service
     private static final String CHANNEL_ID = "chintu_hands_free";
     private static final int NOTIFICATION_ID = 7101;
 
-    private static final long START_WATCHDOG_MS = 6_000L;
-    private static final long SESSION_WATCHDOG_MS = 18_000L;
-    private static final long RESULT_WATCHDOG_MS = 7_000L;
+    private static final long START_WATCHDOG_MS = 8_000L;
+    private static final long SESSION_WATCHDOG_MS = 45_000L;
+    private static final long RESULT_WATCHDOG_MS = 8_000L;
     private static final long COMMAND_WINDOW_MS = 15_000L;
-    private static final long IGNORE_AFTER_TTS_MS = 750L;
+    private static final long COMMAND_EXECUTION_TIMEOUT_MS = 15_000L;
+    private static final long IGNORE_AFTER_TTS_MS = 900L;
+    private static final long MIN_RESTART_GAP_MS = 650L;
+    private static final long STATUS_THROTTLE_MS = 450L;
+    private static final long NOTIFICATION_THROTTLE_MS = 2_000L;
     private static final long WAKE_LOCK_TIMEOUT_MS = 10L * 60L * 1000L;
     private static final long WAKE_LOCK_RENEW_MS = 9L * 60L * 1000L;
 
@@ -77,8 +84,9 @@ public final class HandsFreeVoiceService extends Service
         COMMAND_RESPONSE
     }
 
+    private static volatile boolean processRunning;
+
     private final Handler handler = new Handler(Looper.getMainLooper());
-    private final ExecutorService commandExecutor = Executors.newSingleThreadExecutor();
 
     private SpeechRecognizer recognizer;
     private TextToSpeech tts;
@@ -91,10 +99,12 @@ public final class HandsFreeVoiceService extends Service
     private boolean listening;
     private boolean executingCommand;
     private boolean ttsReady;
+    private boolean ttsInitializing;
 
     private int languageIndex;
     private int consecutiveFailures;
     private int utteranceSequence;
+    private int commandSequence;
 
     private String lastPartial = "";
     private String lastStatus = "";
@@ -105,6 +115,9 @@ public final class HandsFreeVoiceService extends Service
     private long suppressErrorsUntil;
     private long commandWindowUntil;
     private long ignoreAudioUntil;
+    private long lastSessionStartAt;
+    private long lastStatusBroadcastAt;
+    private long lastNotificationAt;
 
     private SpeechPurpose speechPurpose = SpeechPurpose.NONE;
     private SpeechPurpose pendingSpeechPurpose = SpeechPurpose.NONE;
@@ -113,11 +126,26 @@ public final class HandsFreeVoiceService extends Service
     private Runnable startWatchdog;
     private Runnable sessionWatchdog;
     private Runnable resultWatchdog;
+    private Runnable commandWatchdog;
     private Runnable wakeLockRenewal;
     private Runnable ttsWatchdog;
     private Runnable ttsInitWatchdog;
 
+    @SuppressLint("Deprecated")
     public static boolean isEnabled(Context context) {
+        if (processRunning) return true;
+        try {
+            ActivityManager manager =
+                    (ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE);
+            if (manager != null) {
+                ComponentName expected = new ComponentName(context, HandsFreeVoiceService.class);
+                for (ActivityManager.RunningServiceInfo info : manager.getRunningServices(50)) {
+                    if (expected.equals(info.service) && info.started) return true;
+                }
+            }
+        } catch (RuntimeException ignored) {
+            // Fall back to the persisted user choice below.
+        }
         return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                 .getBoolean(PREF_ENABLED, false);
     }
@@ -125,12 +153,12 @@ public final class HandsFreeVoiceService extends Service
     @Override
     public void onCreate() {
         super.onCreate();
+        processRunning = true;
         createNotificationChannel();
-        tts = new TextToSpeech(this, this);
         PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
         if (power != null) {
             wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,
-                    "ChintuAI:RedmiSafeHandsFree");
+                    "ChintuAI:AnrSafeHandsFree");
             wakeLock.setReferenceCounted(false);
         }
     }
@@ -144,7 +172,7 @@ public final class HandsFreeVoiceService extends Service
             return START_NOT_STICKY;
         }
 
-        if (intent == null && !isEnabled(this)) {
+        if (intent == null && !persistedEnabled()) {
             explicitStop = true;
             stopSelf();
             return START_NOT_STICKY;
@@ -154,17 +182,14 @@ public final class HandsFreeVoiceService extends Service
                 != PackageManager.PERMISSION_GRANTED) {
             explicitStop = true;
             setEnabled(false);
-            broadcastStatus("مائیکروفون اجازت نہیں", "ایپ کھول کر مائیکروفون Allow کریں", true);
+            broadcastStatus("مائیکروفون اجازت نہیں",
+                    "ایپ کھول کر مائیکروفون Allow کریں", true);
             stopSelf();
             return START_NOT_STICKY;
         }
 
         if (active && !stopped) {
-            broadcastStatus(commandWindowOpen() ? "جی، بولیں" : "مالک لاک فعال ہے",
-                    commandWindowOpen()
-                            ? "پندرہ سیکنڈ کے اندر مکمل کمانڈ بولیں"
-                            : "کہیں: چنٹو، پھر کمانڈ",
-                    true);
+            broadcastListeningState(true);
             if (!starting && !listening && !executingCommand) scheduleRestart(0L, false);
             return START_STICKY;
         }
@@ -184,14 +209,19 @@ public final class HandsFreeVoiceService extends Service
         setEnabled(true);
         startAsForeground();
         acquireWakeLock();
+        initTtsIfNeeded();
         broadcastStatus("مالک لاک فعال ہے", "کہیں: چنٹو، پھر کمانڈ", true);
-        scheduleRestart(0L, false);
+        scheduleRestart(250L, false);
         return START_STICKY;
     }
 
     @Override
     public IBinder onBind(Intent intent) {
         return null;
+    }
+
+    private boolean persistedEnabled() {
+        return getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(PREF_ENABLED, false);
     }
 
     private void startAsForeground() {
@@ -236,51 +266,86 @@ public final class HandsFreeVoiceService extends Service
         if (manager != null) manager.createNotificationChannel(channel);
     }
 
+    private void initTtsIfNeeded() {
+        if (tts != null || ttsInitializing) return;
+        ttsInitializing = true;
+        try {
+            tts = new TextToSpeech(this, this);
+        } catch (RuntimeException error) {
+            tts = null;
+            ttsInitializing = false;
+            ttsReady = false;
+        }
+    }
+
     private void startListeningSession() {
         clearRestart();
         if (stopped || explicitStop || executingCommand) return;
 
-        stopRecognitionSession(true);
-        if (!createRecognizer()) {
+        long elapsed = SystemClock.uptimeMillis() - lastSessionStartAt;
+        if (lastSessionStartAt > 0L && elapsed < MIN_RESTART_GAP_MS) {
+            scheduleRestart(MIN_RESTART_GAP_MS - elapsed, false);
+            return;
+        }
+
+        if (!ensureRecognizer()) {
             consecutiveFailures++;
             broadcastStatus("وائس سروس دوبارہ جوڑ رہا ہوں",
-                    "مائیک بند نہیں ہوا؛ دوبارہ کوشش جاری ہے", false);
+                    "ایپ بند نہیں ہوئی؛ محفوظ کوشش جاری ہے", false);
             scheduleRestart(nextRetryDelay(), false);
             return;
         }
 
+        cancelRecognition(false);
+        handler.postDelayed(this::startRecognizerAfterCancel, 180L);
+    }
+
+    private void startRecognizerAfterCancel() {
+        if (stopped || explicitStop || executingCommand || recognizer == null) return;
         lastPartial = "";
         starting = true;
         listening = false;
+        lastSessionStartAt = SystemClock.uptimeMillis();
         recognizer.setRecognitionListener(this);
-
         try {
             recognizer.startListening(createRecognitionIntent());
             scheduleStartWatchdog();
             scheduleSessionWatchdog();
-            broadcastStatus(commandWindowOpen() ? "جی، بولیں" : "مالک لاک فعال ہے",
-                    commandWindowOpen()
-                            ? "پندرہ سیکنڈ کے اندر مکمل کمانڈ بولیں"
-                            : "کہیں: چنٹو، پھر کمانڈ",
-                    false);
+            broadcastListeningState(false);
         } catch (RuntimeException error) {
             starting = false;
             consecutiveFailures++;
-            destroyRecognizer();
+            if (consecutiveFailures >= 4) recreateRecognizerAfterCooldown();
             rotateLanguageAfterRepeatedFailure();
             scheduleRestart(nextRetryDelay(), false);
         }
     }
 
-    private boolean createRecognizer() {
+    private boolean ensureRecognizer() {
+        if (recognizer != null) return true;
         if (!SpeechRecognizer.isRecognitionAvailable(this)) return false;
         try {
             recognizer = SpeechRecognizer.createSpeechRecognizer(this);
-            return recognizer != null;
+            recognizer.setRecognitionListener(this);
+            return true;
         } catch (RuntimeException error) {
             recognizer = null;
             return false;
         }
+    }
+
+    private void recreateRecognizerAfterCooldown() {
+        SpeechRecognizer current = recognizer;
+        recognizer = null;
+        consecutiveFailures = 0;
+        if (current == null) return;
+        handler.postDelayed(() -> {
+            try {
+                current.destroy();
+            } catch (RuntimeException ignored) {
+                // Xiaomi binder may already have released the recognizer.
+            }
+        }, 500L);
     }
 
     private Intent createRecognitionIntent() {
@@ -291,25 +356,25 @@ public final class HandsFreeVoiceService extends Service
                 languageIndex, RECOGNITION_LANGUAGES.length - 1)];
         intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, language);
         intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, language);
-        intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 15);
+        intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 12);
         intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
         intent.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false);
-        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 30_000L);
-        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 5_000L);
+        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 25_000L);
+        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 5_500L);
         intent.putExtra(
                 RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS,
-                7_000L);
+                7_500L);
 
         if (Build.VERSION.SDK_INT >= 33) {
             intent.putExtra(RecognizerIntent.EXTRA_ENABLE_BIASING_DEVICE_CONTEXT, true);
-            ArrayList<String> bias = new ArrayList<>(Arrays.asList(
-                    "چنٹو", "چنٹو ذیشان", "واٹس ایپ", "واٹسپ", "واٹساپ",
-                    "فیس بک", "انسٹاگرام", "یوٹیوب", "ٹیلیگرام", "ٹک ٹاک",
-                    "واٹس ایپ کھولو", "فیس بک کھولو", "نیچے سکرول کرو",
-                    "اوپر سکرول کرو", "پوسٹ لکھو", "ٹائپ کرو", "کلک کرو",
-                    "ہوم کو کال کرو", "واپس جاؤ", "اسکرین شاٹ لو", "تصدیق کرو",
-                    "व्हाट्सएप", "फेसबुक", "इंस्टाग्राम", "नीचे स्क्रॉल करो"));
-            intent.putStringArrayListExtra(RecognizerIntent.EXTRA_BIASING_STRINGS, bias);
+            intent.putStringArrayListExtra(RecognizerIntent.EXTRA_BIASING_STRINGS,
+                    new ArrayList<>(Arrays.asList(
+                            "چنٹو", "چنٹو ذیشان", "واٹس ایپ", "واٹسپ", "واٹساپ",
+                            "فیس بک", "انسٹاگرام", "یوٹیوب", "ٹیلیگرام", "ٹک ٹاک",
+                            "واٹس ایپ کھولو", "فیس بک کھولو", "نیچے سکرول کرو",
+                            "اوپر سکرول کرو", "پوسٹ لکھو", "ٹائپ کرو", "کلک کرو",
+                            "ہوم کو کال کرو", "واپس جاؤ", "اسکرین شاٹ لو",
+                            "व्हाट्सएप", "फेसबुक", "इंस्टाग्राम", "नीचे स्क्रॉल करो")));
         }
         return intent;
     }
@@ -328,29 +393,28 @@ public final class HandsFreeVoiceService extends Service
         removeStartWatchdog();
         startWatchdog = () -> {
             if (stopped || explicitStop || executingCommand || !starting) return;
+            starting = false;
             consecutiveFailures++;
-            destroyRecognizer();
+            cancelRecognition(false);
+            if (consecutiveFailures >= 4) recreateRecognizerAfterCooldown();
             rotateLanguageAfterRepeatedFailure();
             scheduleRestart(nextRetryDelay(), false);
         };
         handler.postDelayed(startWatchdog, START_WATCHDOG_MS);
     }
 
-    /** Prevents the recognizer from sitting visually active forever without returning words. */
     private void scheduleSessionWatchdog() {
         removeSessionWatchdog();
         sessionWatchdog = () -> {
             if (stopped || explicitStop || executingCommand) return;
             String partial = lastPartial.trim();
-            stopRecognitionSession(true);
+            cancelRecognition(false);
             if (!partial.isEmpty() && (hasFlexibleWakeWord(partial) || commandWindowOpen())) {
                 processCandidate(partial, -1f);
                 return;
             }
             languageIndex = (languageIndex + 1) % RECOGNITION_LANGUAGES.length;
-            broadcastStatus(commandWindowOpen() ? "جی، بولیں" : "مالک لاک فعال ہے",
-                    "وائس ماڈل تازہ کر رہا ہوں؛ دوبارہ بولیں", false);
-            scheduleRestart(220L, false);
+            scheduleRestart(850L, false);
         };
         handler.postDelayed(sessionWatchdog, SESSION_WATCHDOG_MS);
     }
@@ -360,9 +424,9 @@ public final class HandsFreeVoiceService extends Service
         resultWatchdog = () -> {
             if (stopped || explicitStop || executingCommand) return;
             String partial = lastPartial.trim();
-            stopRecognitionSession(true);
+            cancelRecognition(false);
             if (!partial.isEmpty()) processCandidate(partial, -1f);
-            else scheduleRestart(180L, false);
+            else scheduleRestart(850L, false);
         };
         handler.postDelayed(resultWatchdog, RESULT_WATCHDOG_MS);
     }
@@ -373,11 +437,7 @@ public final class HandsFreeVoiceService extends Service
         listening = true;
         consecutiveFailures = 0;
         removeStartWatchdog();
-        broadcastStatus(commandWindowOpen() ? "جی، بولیں" : "مالک لاک فعال ہے",
-                commandWindowOpen()
-                        ? "پندرہ سیکنڈ کے اندر مکمل کمانڈ بولیں"
-                        : "کہیں: چنٹو، پھر کمانڈ",
-                false);
+        broadcastListeningState(false);
     }
 
     @Override
@@ -392,7 +452,7 @@ public final class HandsFreeVoiceService extends Service
 
     @Override
     public void onRmsChanged(float rmsdB) {
-        // Raw room noise never changes state or executes a command.
+        // Room noise must not cause UI updates or command execution.
     }
 
     @Override
@@ -420,10 +480,8 @@ public final class HandsFreeVoiceService extends Service
         starting = false;
         listening = false;
         clearRecognitionWatchdogs();
-
         String partial = lastPartial.trim();
         lastPartial = "";
-        stopRecognitionSession(true);
 
         if (!partial.isEmpty() && (hasFlexibleWakeWord(partial) || commandWindowOpen())) {
             processCandidate(partial, -1f);
@@ -441,16 +499,19 @@ public final class HandsFreeVoiceService extends Service
         if (error == SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED
                 || error == SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE) {
             languageIndex = (languageIndex + 1) % RECOGNITION_LANGUAGES.length;
-            broadcastStatus("وائس زبان بدل رہا ہوں",
-                    "Indian Urdu سے متبادل Urdu/Hindi ماڈل آزما رہا ہوں", false);
-            scheduleRestart(350L, false);
+            scheduleRestart(900L, false);
             return;
         }
 
         consecutiveFailures++;
+        if ((error == SpeechRecognizer.ERROR_CLIENT
+                || error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY)
+                && consecutiveFailures >= 4) {
+            recreateRecognizerAfterCooldown();
+        }
         rotateLanguageAfterRepeatedFailure();
         long delay = error == SpeechRecognizer.ERROR_TOO_MANY_REQUESTS
-                ? 2_500L : nextRetryDelay();
+                ? 3_000L : nextRetryDelay();
         scheduleRestart(delay, false);
     }
 
@@ -462,13 +523,9 @@ public final class HandsFreeVoiceService extends Service
         RecognizedCandidate candidate = chooseBestResult(results);
         if (candidate.text.isEmpty()) candidate = new RecognizedCandidate(lastPartial, -1f);
         lastPartial = "";
-        stopRecognitionSession(true);
 
-        if (candidate.text.isEmpty()) {
-            scheduleRestart(180L, false);
-        } else {
-            processCandidate(candidate.text, candidate.confidence);
-        }
+        if (candidate.text.isEmpty()) scheduleRestart(850L, false);
+        else processCandidate(candidate.text, candidate.confidence);
     }
 
     @Override
@@ -484,17 +541,17 @@ public final class HandsFreeVoiceService extends Service
 
     @Override
     public void onSegmentResults(Bundle segmentResults) {
-        // Ordinary Redmi-safe sessions use onResults/onPartialResults.
+        // Standard sessions use onResults/onPartialResults.
     }
 
     @Override
     public void onEndOfSegmentedSession() {
-        // Ordinary Redmi-safe sessions use onResults/onError.
+        // Standard sessions use onResults/onError.
     }
 
     @Override
     public void onEvent(int eventType, Bundle params) {
-        // No vendor-specific event required.
+        // No vendor-specific events required.
     }
 
     private RecognizedCandidate chooseBestResult(Bundle results) {
@@ -538,14 +595,14 @@ public final class HandsFreeVoiceService extends Service
         boolean commandWindow = commandWindowOpen();
 
         if (!hasWakeWord && !commandWindow) {
-            scheduleRestart(160L, false);
+            scheduleRestart(800L, false);
             return;
         }
 
         if (!hasWakeWord && confidence >= 0f && confidence < 0.08f) {
             commandWindowUntil = 0L;
             broadcastStatus("آواز واضح نہیں", "دوبارہ کہیں: چنٹو، پھر کمانڈ", false);
-            scheduleRestart(250L, false);
+            scheduleRestart(900L, false);
             return;
         }
 
@@ -553,7 +610,7 @@ public final class HandsFreeVoiceService extends Service
         if (hasWakeWord && command.isEmpty()) {
             commandWindowUntil = 0L;
             executingCommand = true;
-            stopRecognitionSession(true);
+            cancelRecognition(false);
             broadcastStatus("جی، ذیشان", "جو حکم، بولیں", true);
             speakWithGuard("جی ذیشان، بولیں", SpeechPurpose.WAKE_ACKNOWLEDGEMENT);
             return;
@@ -562,33 +619,58 @@ public final class HandsFreeVoiceService extends Service
         commandWindowUntil = 0L;
         if (looksLikeNoise(command)) {
             broadcastStatus("کمانڈ واضح نہیں", "کہیں: چنٹو، پھر مکمل کمانڈ", false);
-            scheduleRestart(250L, false);
+            scheduleRestart(900L, false);
             return;
         }
 
         executingCommand = true;
-        stopRecognitionSession(true);
+        cancelRecognition(false);
         broadcastStatus("کمانڈ ملی", command, true);
-        String finalCommand = command;
-        commandExecutor.execute(() -> {
-            BackgroundCommandExecutor.Result result =
-                    BackgroundCommandExecutor.execute(getApplicationContext(), finalCommand);
-            handler.post(() -> {
-                broadcastCommand(finalCommand, result.message);
-                if (result.stopHandsFree) {
-                    if (isExactStopCommand(finalCommand)) {
-                        explicitStop = true;
-                        stopHandsFree(result.message);
-                    } else {
-                        speakWithGuard(
-                                "ہینڈز فری بند نہیں کیا۔ بند کرنے کے لیے واضح کہیں: چنٹو ہینڈز فری بند کرو",
-                                SpeechPurpose.COMMAND_RESPONSE);
-                    }
+        dispatchCommandToMainProcess(command);
+    }
+
+    private void dispatchCommandToMainProcess(String command) {
+        int sequence = ++commandSequence;
+        removeCommandWatchdog();
+        commandWatchdog = () -> {
+            if (sequence != commandSequence || !executingCommand) return;
+            executingCommand = false;
+            speakWithGuard("کمانڈ میں دیر ہو گئی، دوبارہ کوشش کریں",
+                    SpeechPurpose.COMMAND_RESPONSE);
+        };
+        handler.postDelayed(commandWatchdog, COMMAND_EXECUTION_TIMEOUT_MS);
+
+        ResultReceiver reply = new ResultReceiver(handler) {
+            @Override
+            protected void onReceiveResult(int resultCode, Bundle resultData) {
+                if (sequence != commandSequence || stopped || explicitStop) return;
+                removeCommandWatchdog();
+                String message = resultData == null ? ""
+                        : resultData.getString(CommandExecutionReceiver.RESULT_MESSAGE, "");
+                boolean stop = resultData != null && resultData.getBoolean(
+                        CommandExecutionReceiver.RESULT_STOP_HANDS_FREE, false);
+                broadcastCommand(command, message);
+                if (stop && isExactStopCommand(command)) {
+                    explicitStop = true;
+                    stopHandsFree(message);
                 } else {
-                    speakWithGuard(result.message, SpeechPurpose.COMMAND_RESPONSE);
+                    speakWithGuard(message, SpeechPurpose.COMMAND_RESPONSE);
                 }
-            });
-        });
+            }
+        };
+
+        Intent intent = new Intent(this, CommandExecutionReceiver.class)
+                .setAction(CommandExecutionReceiver.ACTION_EXECUTE)
+                .putExtra(CommandExecutionReceiver.EXTRA_COMMAND, command)
+                .putExtra(CommandExecutionReceiver.EXTRA_REPLY, reply);
+        try {
+            sendBroadcast(intent);
+        } catch (RuntimeException error) {
+            removeCommandWatchdog();
+            executingCommand = false;
+            speakWithGuard("کمانڈ سروس دستیاب نہیں، دوبارہ کوشش کریں",
+                    SpeechPurpose.COMMAND_RESPONSE);
+        }
     }
 
     private boolean hasFlexibleWakeWord(String raw) {
@@ -646,6 +728,7 @@ public final class HandsFreeVoiceService extends Service
             return;
         }
 
+        initTtsIfNeeded();
         if (!ttsReady || tts == null) {
             pendingSpeechText = text;
             pendingSpeechPurpose = purpose;
@@ -657,7 +740,7 @@ public final class HandsFreeVoiceService extends Service
                     completeSpeech(pendingPurpose);
                 }
             };
-            handler.postDelayed(ttsInitWatchdog, 1_800L);
+            handler.postDelayed(ttsInitWatchdog, 2_200L);
             return;
         }
 
@@ -690,13 +773,11 @@ public final class HandsFreeVoiceService extends Service
         speechPurpose = SpeechPurpose.NONE;
         pendingSpeechText = "";
         pendingSpeechPurpose = SpeechPurpose.NONE;
-
-        long now = SystemClock.uptimeMillis();
-        ignoreAudioUntil = now + IGNORE_AFTER_TTS_MS;
+        ignoreAudioUntil = SystemClock.uptimeMillis() + IGNORE_AFTER_TTS_MS;
         executingCommand = false;
 
         if (completedPurpose == SpeechPurpose.WAKE_ACKNOWLEDGEMENT) {
-            commandWindowUntil = now + COMMAND_WINDOW_MS;
+            commandWindowUntil = SystemClock.uptimeMillis() + COMMAND_WINDOW_MS;
             broadcastStatus("جی، بولیں", "پندرہ سیکنڈ کے اندر مکمل کمانڈ بولیں", true);
             scheduleRestart(IGNORE_AFTER_TTS_MS, false);
         } else {
@@ -707,17 +788,28 @@ public final class HandsFreeVoiceService extends Service
 
     @Override
     public void onInit(int status) {
+        ttsInitializing = false;
         if (status != TextToSpeech.SUCCESS || tts == null) {
             ttsReady = false;
             finishPendingSpeechWithoutVoice();
             return;
         }
 
-        ChintuVoiceProfile.Selection selection = ChintuVoiceProfile.configure(tts);
+        int language = tts.setLanguage(new Locale("ur", "IN"));
+        if (language == TextToSpeech.LANG_MISSING_DATA
+                || language == TextToSpeech.LANG_NOT_SUPPORTED) {
+            language = tts.setLanguage(new Locale("ur", "PK"));
+        }
+        if (language == TextToSpeech.LANG_MISSING_DATA
+                || language == TextToSpeech.LANG_NOT_SUPPORTED) {
+            tts.setLanguage(new Locale("hi", "IN"));
+        }
+        tts.setSpeechRate(0.96f);
+        tts.setPitch(0.72f);
         tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
             @Override
             public void onStart(String utteranceId) {
-                // Recognition stays closed while Chintu speaks.
+                // Recognition stays paused while Chintu speaks.
             }
 
             @Override
@@ -735,7 +827,7 @@ public final class HandsFreeVoiceService extends Service
                 handler.post(() -> finishUtteranceIfCurrent(utteranceId));
             }
         });
-        ttsReady = selection.configured || tts.getVoice() != null;
+        ttsReady = true;
 
         if (!pendingSpeechText.isEmpty()) {
             String pendingText = pendingSpeechText;
@@ -756,16 +848,27 @@ public final class HandsFreeVoiceService extends Service
 
     private void finishUtteranceIfCurrent(String utteranceId) {
         if (utteranceId == null || !utteranceId.equals(activeUtteranceId)) return;
-        SpeechPurpose completed = speechPurpose;
-        completeSpeech(completed);
+        completeSpeech(speechPurpose);
+    }
+
+    private void broadcastListeningState(boolean force) {
+        broadcastStatus(commandWindowOpen() ? "جی، بولیں" : "مالک لاک فعال ہے",
+                commandWindowOpen()
+                        ? "پندرہ سیکنڈ کے اندر مکمل کمانڈ بولیں"
+                        : "کہیں: چنٹو، پھر کمانڈ",
+                force);
     }
 
     private void broadcastStatus(String status, String detail, boolean force) {
         String safeStatus = status == null ? "" : status;
         String safeDetail = detail == null ? "" : detail;
+        long now = SystemClock.uptimeMillis();
         if (!force && safeStatus.equals(lastStatus) && safeDetail.equals(lastDetail)) return;
+        if (!force && now - lastStatusBroadcastAt < STATUS_THROTTLE_MS) return;
+
         lastStatus = safeStatus;
         lastDetail = safeDetail;
+        lastStatusBroadcastAt = now;
 
         Intent intent = new Intent(ACTION_STATUS)
                 .setPackage(getPackageName())
@@ -773,10 +876,13 @@ public final class HandsFreeVoiceService extends Service
                 .putExtra(EXTRA_DETAIL, safeDetail);
         sendBroadcast(intent);
 
-        NotificationManager manager =
-                (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
-        if (manager != null && isEnabled(this)) {
-            manager.notify(NOTIFICATION_ID, buildNotification(safeStatus));
+        if (force || now - lastNotificationAt >= NOTIFICATION_THROTTLE_MS) {
+            NotificationManager manager =
+                    (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            if (manager != null && active && !stopped) {
+                manager.notify(NOTIFICATION_ID, buildNotification(safeStatus));
+                lastNotificationAt = now;
+            }
         }
     }
 
@@ -796,26 +902,18 @@ public final class HandsFreeVoiceService extends Service
 
     private long nextRetryDelay() {
         int exponent = Math.min(consecutiveFailures, 3);
-        return Math.min(2_200L, 220L * (1L << exponent));
+        return Math.min(3_000L, 500L * (1L << exponent));
     }
 
-    private void stopRecognitionSession(boolean destroy) {
+    private void cancelRecognition(boolean suppressCallback) {
         clearRecognitionWatchdogs();
-        suppressErrorsUntil = SystemClock.uptimeMillis() + 850L;
+        if (suppressCallback) suppressErrorsUntil = SystemClock.uptimeMillis() + 1_000L;
         SpeechRecognizer current = recognizer;
-        if (current != null) {
+        if (current != null && (starting || listening)) {
             try {
                 current.cancel();
             } catch (RuntimeException ignored) {
-                // Vendor recognizer may already be closed.
-            }
-            if (destroy) {
-                try {
-                    current.destroy();
-                } catch (RuntimeException ignored) {
-                    // Vendor compatibility.
-                }
-                recognizer = null;
+                // Vendor recognizer may already be idle.
             }
         }
         starting = false;
@@ -823,21 +921,40 @@ public final class HandsFreeVoiceService extends Service
     }
 
     private void destroyRecognizer() {
-        stopRecognitionSession(true);
+        SpeechRecognizer current = recognizer;
+        recognizer = null;
+        if (current == null) return;
+        try {
+            current.cancel();
+        } catch (RuntimeException ignored) {
+            // Vendor compatibility.
+        }
+        try {
+            current.destroy();
+        } catch (RuntimeException ignored) {
+            // Vendor compatibility.
+        }
     }
 
     private void stopHandsFree(String status) {
         stopped = true;
         active = false;
+        processRunning = false;
         executingCommand = false;
         speechPurpose = SpeechPurpose.NONE;
         commandWindowUntil = 0L;
         clearTimers();
-        removeTtsWatchdog();
-        removeTtsInitWatchdog();
         destroyRecognizer();
         releaseWakeLock();
-        if (tts != null) tts.stop();
+        if (tts != null) {
+            try {
+                tts.stop();
+                tts.shutdown();
+            } catch (RuntimeException ignored) {
+                // TTS engine may already be disconnected.
+            }
+            tts = null;
+        }
         setEnabled(false);
         if (status != null && !status.isEmpty()) broadcastCommand("", status);
         stopForeground(true);
@@ -858,7 +975,7 @@ public final class HandsFreeVoiceService extends Service
             wakeLockRenewal = this::acquireWakeLock;
             handler.postDelayed(wakeLockRenewal, WAKE_LOCK_RENEW_MS);
         } catch (RuntimeException ignored) {
-            // Foreground service continues even if HyperOS blocks the wake lock.
+            // Foreground service continues if HyperOS blocks the wake lock.
         }
     }
 
@@ -894,6 +1011,11 @@ public final class HandsFreeVoiceService extends Service
         resultWatchdog = null;
     }
 
+    private void removeCommandWatchdog() {
+        if (commandWatchdog != null) handler.removeCallbacks(commandWatchdog);
+        commandWatchdog = null;
+    }
+
     private void removeTtsWatchdog() {
         if (ttsWatchdog != null) handler.removeCallbacks(ttsWatchdog);
         ttsWatchdog = null;
@@ -913,25 +1035,37 @@ public final class HandsFreeVoiceService extends Service
     private void clearTimers() {
         clearRestart();
         clearRecognitionWatchdogs();
+        removeCommandWatchdog();
+        removeTtsWatchdog();
+        removeTtsInitWatchdog();
+        if (wakeLockRenewal != null) handler.removeCallbacks(wakeLockRenewal);
     }
 
     @Override
     public void onDestroy() {
+        processRunning = false;
         stopped = true;
         active = false;
-        executingCommand = false;
         clearTimers();
-        removeTtsWatchdog();
-        removeTtsInitWatchdog();
         destroyRecognizer();
         releaseWakeLock();
-        commandExecutor.shutdownNow();
         if (tts != null) {
-            tts.stop();
-            tts.shutdown();
+            try {
+                tts.stop();
+                tts.shutdown();
+            } catch (RuntimeException ignored) {
+                // Engine disconnected.
+            }
         }
-        // Keep the preference true when Android/HyperOS kills a sticky service unexpectedly.
-        if (explicitStop) setEnabled(false);
+        if (!explicitStop && persistedEnabled()) {
+            Intent restart = new Intent(this, HandsFreeVoiceService.class).setAction(ACTION_START);
+            try {
+                if (Build.VERSION.SDK_INT >= 26) startForegroundService(restart);
+                else startService(restart);
+            } catch (RuntimeException ignored) {
+                // HyperOS may defer restart until the user opens Chintu again.
+            }
+        }
         super.onDestroy();
     }
 
