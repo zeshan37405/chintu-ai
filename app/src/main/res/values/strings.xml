@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Chintu AI</string>
-    <string name="accessibility_service_description">Allows Chintu to perform only explicit voice-requested global actions such as Home, Back, Recents, notifications, lock screen and screenshot. It does not read screen content.</string>
+    <string name="accessibility_service_description">Allows Chintu to perform explicit owner-requested actions such as Home, Back, scrolling, swiping, typing and clicking visible controls. Current screen content is used only in memory to locate the requested control and is not stored or transmitted.</string>
 </resources>
