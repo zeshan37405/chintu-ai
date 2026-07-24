@@ -14,17 +14,17 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Main-thread speech recognizer state machine with stale-callback isolation,
- * Redmi/HyperOS watchdogs, bounded retry, and system-recognizer fallback.
+ * Fast one-shot recognizer for the large voice button. It is pre-warmed while the activity is
+ * visible, never opens the Google popup automatically, and silently re-arms when Redmi/HyperOS
+ * ends a session too early.
  */
 public final class VoiceRecognitionController {
-    private static final int MAX_DIRECT_RETRIES = 1;
-    private static final long CREATE_DELAY_MS = 280L;
-    private static final long RETRY_DELAY_MS = 900L;
-    private static final long BUSY_RETRY_DELAY_MS = 1450L;
-    private static final long START_WATCHDOG_MS = 5500L;
-    private static final long LISTEN_WATCHDOG_MS = 22000L;
-    private static final long RESULT_WATCHDOG_MS = 6500L;
+    private static final int MAX_DIRECT_RETRIES = 4;
+    private static final long NORMAL_RETRY_MS = 180L;
+    private static final long BUSY_RETRY_MS = 850L;
+    private static final long START_WATCHDOG_MS = 3200L;
+    private static final long LISTEN_WATCHDOG_MS = 45000L;
+    private static final long RESULT_WATCHDOG_MS = 8000L;
 
     public enum State {
         IDLE,
@@ -61,7 +61,7 @@ public final class VoiceRecognitionController {
     private boolean foreground = true;
     private boolean released;
 
-    private Runnable prepareRunnable;
+    private Runnable retryRunnable;
     private Runnable startWatchdog;
     private Runnable listenWatchdog;
     private Runnable resultWatchdog;
@@ -79,10 +79,28 @@ public final class VoiceRecognitionController {
         return state != State.IDLE && state != State.SYSTEM_FALLBACK;
     }
 
+    /** Creates the speech service before the user taps, removing first-tap startup lag. */
+    public void prepare() {
+        runOnMain(() -> {
+            if (released || !foreground || recognizer != null) return;
+            if (!SpeechRecognizer.isRecognitionAvailable(context)) return;
+            try {
+                recognizer = SpeechRecognizer.createSpeechRecognizer(context);
+            } catch (RuntimeException ignored) {
+                recognizer = null;
+            }
+        });
+    }
+
     public void setForeground(boolean foreground) {
         runOnMain(() -> {
             this.foreground = foreground;
-            if (!foreground) cancelInternal(false, "");
+            if (foreground) {
+                prepare();
+            } else {
+                cancelInternal(false, "");
+                destroyRecognizer();
+            }
         });
     }
 
@@ -93,10 +111,11 @@ public final class VoiceRecognitionController {
                 callback.onVoiceUnavailable("ایپ سامنے آنے کے بعد دوبارہ کوشش کریں");
                 return;
             }
-            cancelInternal(false, "");
+            clearTimers();
+            cancelRecognizerOnly();
             retryCount = 0;
             lastPartial = "";
-            startDirect(CREATE_DELAY_MS);
+            startSession(0L);
         });
     }
 
@@ -129,7 +148,7 @@ public final class VoiceRecognitionController {
     public void onSystemLaunchFailed() {
         runOnMain(() -> {
             state = State.IDLE;
-            callback.onVoiceUnavailable("فون میں وائس شناخت سروس دستیاب نہیں");
+            callback.onVoiceUnavailable("فون میں Google وائس ونڈو دستیاب نہیں");
         });
     }
 
@@ -138,39 +157,48 @@ public final class VoiceRecognitionController {
             released = true;
             foreground = false;
             cancelInternal(false, "");
-            callback.onVoiceState(State.IDLE, "", "");
+            destroyRecognizer();
         });
     }
 
-    private void startDirect(long delayMs) {
+    private void startSession(long delayMs) {
         clearTimers();
-        destroyRecognizer();
         if (released || !foreground) return;
-        if (!SpeechRecognizer.isRecognitionAvailable(context)) {
-            requestSystemFallback("براہ راست وائس شناخت دستیاب نہیں");
-            return;
-        }
-
         final int session = ++generation;
         state = State.PREPARING;
-        callback.onVoiceState(state, "وائس تیار ہو رہی ہے", "ایک لمحہ...");
+        callback.onVoiceState(state, "سننے کے لیے تیار", "اب بولیں");
 
-        prepareRunnable = () -> {
-            if (!isCurrent(session) || !foreground) return;
+        retryRunnable = () -> {
+            if (!isCurrent(session)) return;
+            if (!ensureRecognizer()) {
+                failCompletely("فون کی وائس شناخت سروس دستیاب نہیں");
+                return;
+            }
             try {
-                recognizer = SpeechRecognizer.createSpeechRecognizer(context);
                 recognizer.setRecognitionListener(createListener(session));
-                Intent intent = createRecognitionIntent();
                 state = State.STARTING;
-                callback.onVoiceState(state, "سننے کی تیاری", "اب واضح آواز میں بولیں");
-                recognizer.startListening(intent);
+                callback.onVoiceState(state, "سن رہا ہوں", "اب حکم بولیں");
+                recognizer.startListening(createRecognitionIntent());
                 scheduleStartWatchdog(session);
                 scheduleListenWatchdog(session);
             } catch (RuntimeException error) {
                 recover(session, "وائس شناخت شروع نہیں ہوئی", SpeechRecognizer.ERROR_CLIENT);
             }
         };
-        handler.postDelayed(prepareRunnable, Math.max(0L, delayMs));
+        if (delayMs <= 0L) retryRunnable.run();
+        else handler.postDelayed(retryRunnable, delayMs);
+    }
+
+    private boolean ensureRecognizer() {
+        if (recognizer != null) return true;
+        if (!SpeechRecognizer.isRecognitionAvailable(context)) return false;
+        try {
+            recognizer = SpeechRecognizer.createSpeechRecognizer(context);
+            return true;
+        } catch (RuntimeException error) {
+            recognizer = null;
+            return false;
+        }
     }
 
     private RecognitionListener createListener(final int session) {
@@ -180,7 +208,7 @@ public final class VoiceRecognitionController {
                 if (!isCurrent(session)) return;
                 removeStartWatchdog();
                 state = State.LISTENING;
-                callback.onVoiceState(state, "سن رہا ہوں", "اب حکم بولیں");
+                callback.onVoiceState(state, "سن رہا ہوں", "آرام سے مکمل کمانڈ بولیں");
             }
 
             @Override
@@ -193,7 +221,7 @@ public final class VoiceRecognitionController {
 
             @Override
             public void onRmsChanged(float rmsdB) {
-                // Deliberately ignored to avoid UI churn on low-memory Redmi devices.
+                // Avoid frequent UI work on the Redmi Note 11.
             }
 
             @Override
@@ -235,7 +263,7 @@ public final class VoiceRecognitionController {
                 String best = CommandEngine.chooseBest(matches);
                 if (best.isEmpty()) best = lastPartial;
                 if (best == null || best.trim().isEmpty()) {
-                    recover(session, "نتیجہ نہیں ملا", SpeechRecognizer.ERROR_NO_MATCH);
+                    recover(session, "آواز واضح نہیں ملی", SpeechRecognizer.ERROR_NO_MATCH);
                 } else {
                     finish(session, best);
                 }
@@ -256,7 +284,7 @@ public final class VoiceRecognitionController {
 
             @Override
             public void onEvent(int eventType, Bundle params) {
-                // No vendor-specific events are required.
+                // No vendor-specific events required.
             }
         };
     }
@@ -264,54 +292,47 @@ public final class VoiceRecognitionController {
     private void finish(int session, String command) {
         if (!isCurrent(session)) return;
         clearTimers();
-        String cleaned = command == null ? "" : command.trim();
-        destroyRecognizer();
         generation++;
         state = State.IDLE;
+        String cleaned = command == null ? "" : command.trim();
         lastPartial = "";
-        if (cleaned.isEmpty()) {
-            callback.onVoiceUnavailable("آواز واضح نہیں ملی");
-        } else {
-            callback.onCommandRecognized(cleaned);
-        }
+        if (cleaned.isEmpty()) callback.onVoiceUnavailable("آواز واضح نہیں ملی");
+        else callback.onCommandRecognized(cleaned);
     }
 
     private void recover(int session, String reason, int errorCode) {
         if (!isCurrent(session)) return;
         clearTimers();
-        destroyRecognizer();
+        cancelRecognizerOnly();
         generation++;
         if (released || !foreground) {
             state = State.IDLE;
             return;
         }
-
         if (retryCount < MAX_DIRECT_RETRIES) {
             retryCount++;
             state = State.RECOVERING;
-            callback.onVoiceState(state, "دوبارہ کوشش", reason);
-            long delay = errorCode == SpeechRecognizer.ERROR_RECOGNIZER_BUSY
-                    ? BUSY_RETRY_DELAY_MS : RETRY_DELAY_MS;
-            startDirect(delay);
+            callback.onVoiceState(state, "سن رہا ہوں", "آواز کا انتظار ہے...");
+            if (errorCode == SpeechRecognizer.ERROR_CLIENT
+                    || errorCode == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) {
+                destroyRecognizer();
+            }
+            startSession(errorCode == SpeechRecognizer.ERROR_RECOGNIZER_BUSY
+                    ? BUSY_RETRY_MS : NORMAL_RETRY_MS);
         } else {
-            requestSystemFallback(reason);
+            failCompletely(reason + " — دوبارہ بٹن دبائیں یا ہینڈز فری چلائیں");
         }
     }
 
-    private void requestSystemFallback(String reason) {
+    private void failCompletely(String reason) {
         clearTimers();
-        destroyRecognizer();
         generation++;
-        if (released || !foreground) {
-            state = State.IDLE;
-            return;
-        }
-        state = State.SYSTEM_FALLBACK;
-        callback.onVoiceState(state, "متبادل وائس شناخت", reason);
-        callback.onSystemRecognizerRequested(createRecognitionIntent());
+        state = State.IDLE;
+        lastPartial = "";
+        callback.onVoiceUnavailable(reason);
     }
 
-    private Intent createRecognitionIntent() {
+    public Intent createRecognitionIntent() {
         Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
         intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,
                 RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
@@ -320,12 +341,12 @@ public final class VoiceRecognitionController {
         intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 10);
         intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
         intent.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false);
-        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,
-                2400L);
+        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 30000L);
+        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 6000L);
         intent.putExtra(
                 RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS,
-                3400L);
-        intent.putExtra(RecognizerIntent.EXTRA_PROMPT, "چنٹو کو حکم بولیں");
+                8000L);
+        intent.putExtra(RecognizerIntent.EXTRA_PROMPT, "چنٹو کو مکمل حکم بولیں");
         return intent;
     }
 
@@ -334,7 +355,7 @@ public final class VoiceRecognitionController {
         startWatchdog = () -> {
             if (!isCurrent(session)) return;
             if (!lastPartial.isEmpty()) finish(session, lastPartial);
-            else recover(session, "آواز شناخت شروع نہیں ہوئی", SpeechRecognizer.ERROR_CLIENT);
+            else recover(session, "وائس سروس اٹک گئی", SpeechRecognizer.ERROR_CLIENT);
         };
         handler.postDelayed(startWatchdog, START_WATCHDOG_MS);
     }
@@ -362,19 +383,29 @@ public final class VoiceRecognitionController {
     private void cancelInternal(boolean notify, String detail) {
         clearTimers();
         generation++;
-        destroyRecognizer();
+        cancelRecognizerOnly();
         lastPartial = "";
         state = State.IDLE;
         if (notify) callback.onVoiceState(state, "سننا روک دیا", detail == null ? "" : detail);
     }
 
-    private void destroyRecognizer() {
+    private void cancelRecognizerOnly() {
         if (recognizer == null) return;
-        suppressErrorsUntil = SystemClock.uptimeMillis() + 1000L;
+        suppressErrorsUntil = SystemClock.uptimeMillis() + 800L;
         try {
             recognizer.cancel();
         } catch (RuntimeException ignored) {
-            // Xiaomi recognition services can throw while an inactive session is cancelled.
+            // Xiaomi speech services occasionally reject cancel on an idle recognizer.
+        }
+    }
+
+    private void destroyRecognizer() {
+        if (recognizer == null) return;
+        suppressErrorsUntil = SystemClock.uptimeMillis() + 900L;
+        try {
+            recognizer.cancel();
+        } catch (RuntimeException ignored) {
+            // Xiaomi compatibility.
         }
         try {
             recognizer.destroy();
@@ -420,11 +451,11 @@ public final class VoiceRecognitionController {
     }
 
     private void clearTimers() {
-        if (prepareRunnable != null) handler.removeCallbacks(prepareRunnable);
+        if (retryRunnable != null) handler.removeCallbacks(retryRunnable);
+        retryRunnable = null;
         removeStartWatchdog();
         removeListenWatchdog();
         removeResultWatchdog();
-        prepareRunnable = null;
     }
 
     private void removeStartWatchdog() {
