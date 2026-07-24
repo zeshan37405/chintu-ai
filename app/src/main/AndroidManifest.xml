@@ -120,10 +120,15 @@
             </intent-filter>
         </activity>
 
+        <receiver
+            android:name=".CommandExecutionReceiver"
+            android:exported="false" />
+
         <service
             android:name=".HandsFreeVoiceService"
             android:exported="false"
             android:foregroundServiceType="microphone"
+            android:process=":voice"
             android:stopWithTask="false" />
 
         <service
