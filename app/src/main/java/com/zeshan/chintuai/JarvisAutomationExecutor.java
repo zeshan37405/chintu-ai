@@ -21,7 +21,12 @@ public final class JarvisAutomationExecutor {
     }
 
     public static BackgroundCommandExecutor.Result tryExecute(Context context, String raw) {
-        String normalized = CommandEngine.normalize(CommandEngine.stripWakeWord(raw));
+        String canonical = AccentCommandNormalizer.canonicalize(raw);
+        BackgroundCommandExecutor.Result social =
+                SocialAutomationExecutor.tryExecute(context, canonical);
+        if (social != null) return social;
+
+        String normalized = CommandEngine.normalize(CommandEngine.stripWakeWord(canonical));
         if (normalized.isEmpty()) return null;
 
         if (equalsAny(normalized,
@@ -34,8 +39,11 @@ public final class JarvisAutomationExecutor {
             return BackgroundCommandExecutor.Result.ok("زیرِ انتظار کام منسوخ کر دیا ہے");
         }
 
+        boolean mentionsScroll = containsAny(normalized,
+                "سکرول", "اسکرول", "scroll");
         if (containsAny(normalized,
-                "نیچے سکرول", "سکرول نیچے", "اسکرول ڈاؤن", "scroll down")) {
+                "نیچے سکرول", "سکرول نیچے", "اسکرول ڈاؤن", "scroll down")
+                || (mentionsScroll && !containsAny(normalized, "اوپر", "up"))) {
             return accessibilityResult(ChintuAccessibilityService.scrollDown(),
                     "نیچے سکرول کر دیا ہے", "نیچے سکرول نہیں ہوا");
         }
@@ -55,6 +63,13 @@ public final class JarvisAutomationExecutor {
                     "دائیں سوائپ کر دیا ہے", "دائیں سوائپ نہیں ہوا");
         }
 
+        if (containsAny(normalized,
+                "پوسٹ باکس کھولو", "پوسٹ لکھنے والی جگہ", "کیا سوچ رہے",
+                "what s on your mind", "create post")) {
+            return accessibilityResult(ChintuAccessibilityService.focusSocialComposer(),
+                    "پوسٹ لکھنے والی جگہ کھول دی ہے", "پوسٹ لکھنے والی جگہ نہیں ملی");
+        }
+
         if (equalsAny(normalized,
                 "فیلڈ صاف کرو", "سب مٹا دو", "متن مٹا دو", "clear text", "clear field")) {
             return accessibilityResult(ChintuAccessibilityService.clearFocusedText(),
@@ -71,14 +86,15 @@ public final class JarvisAutomationExecutor {
                     "انٹر دبا دیا ہے", "انٹر کا عمل نہیں ہوا");
         }
 
-        String typedText = extractAfterAnyPreservingText(raw,
-                "یہ ٹائپ کرو", "ٹائپ کرو", "یہ لکھو", "لکھو", "type this", "type", "write this");
+        String typedText = extractAfterAnyPreservingText(canonical,
+                "یہ ٹائپ کرو", "ٹائپ کرو", "یہ لکھو", "لکھو",
+                "type this", "type", "write this");
         if (!typedText.isEmpty()) {
             return accessibilityResult(ChintuAccessibilityService.typeIntoFocusedField(typedText),
                     "متن لکھ دیا ہے", "پہلے لکھنے والی جگہ منتخب کریں");
         }
 
-        String clickTarget = extractAfterAnyPreservingText(raw,
+        String clickTarget = extractAfterAnyPreservingText(canonical,
                 "اس پر کلک کرو", "کلک کرو", "اسے دباؤ", "دباؤ", "tap", "click");
         if (!clickTarget.isEmpty()) {
             if (isHighImpactTarget(clickTarget)) {
@@ -152,7 +168,7 @@ public final class JarvisAutomationExecutor {
     private static String extractAfterAnyPreservingText(String raw, String... markers) {
         if (raw == null) return "";
         String source = raw.trim().replaceFirst(
-                "(?iu)^(چنٹو|چنتو|chintu)(\\s+جی|\\s+سنو|\\s+بھائی)?\\s*", "");
+                "(?iu)^(چنٹو|چنتو|چینٹو|chintu)(\\s+جی|\\s+سنو|\\s+بھائی)?\\s*", "");
         String lowerSource = source.toLowerCase(Locale.ROOT);
         for (String marker : markers) {
             String lowerMarker = marker.toLowerCase(Locale.ROOT);
