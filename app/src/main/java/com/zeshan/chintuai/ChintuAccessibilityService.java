@@ -14,10 +14,13 @@ import android.view.accessibility.AccessibilityNodeInfo;
 import java.lang.ref.WeakReference;
 import java.util.ArrayDeque;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Optional user-enabled service for explicit Jarvis-style screen actions. Screen content is used
- * only in memory to find the requested control and is never stored or transmitted.
+ * only in memory to locate the requested control and is never stored or transmitted.
  */
 public final class ChintuAccessibilityService extends AccessibilityService {
     private static WeakReference<ChintuAccessibilityService> active = new WeakReference<>(null);
@@ -57,8 +60,7 @@ public final class ChintuAccessibilityService extends AccessibilityService {
     }
 
     public static boolean perform(int action) {
-        ChintuAccessibilityService service = active.get();
-        return service != null && service.performGlobalAction(action);
+        return withService(service -> service.performGlobalAction(action));
     }
 
     public static boolean scrollDown() {
@@ -97,10 +99,28 @@ public final class ChintuAccessibilityService extends AccessibilityService {
         return withService(service -> service.clickText(text));
     }
 
+    public static boolean focusSocialComposer() {
+        return withService(ChintuAccessibilityService::focusComposerInternal);
+    }
+
+    /** Opens a visible post composer and writes text after the composer animation completes. */
+    public static boolean prepareSocialPost(String text) {
+        return withService(service -> {
+            boolean focused = service.focusComposerInternal();
+            if (!focused) return false;
+            MAIN.postDelayed(() -> {
+                ChintuAccessibilityService current = active.get();
+                if (current != null) current.setFocusedText(text, false);
+            }, 700L);
+            return true;
+        });
+    }
+
     public static boolean clickCommonSubmitButton() {
         String[] labels = {
                 "پوسٹ", "شائع کریں", "شائع", "بھیجیں", "بھیجو", "سینڈ",
-                "Post", "Publish", "Send", "Submit", "Share"
+                "Post", "Publish", "Send", "Submit", "Share",
+                "पोस्ट", "पब्लिश", "भेजें", "सेंड"
         };
         for (String label : labels) {
             if (clickByVisibleText(label)) return true;
@@ -111,17 +131,38 @@ public final class ChintuAccessibilityService extends AccessibilityService {
     private static boolean withService(ServiceAction action) {
         ChintuAccessibilityService service = active.get();
         if (service == null) return false;
-        try {
-            return action.run(service);
-        } catch (RuntimeException ignored) {
-            return false;
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            try {
+                return action.run(service);
+            } catch (RuntimeException ignored) {
+                return false;
+            }
         }
+
+        AtomicBoolean result = new AtomicBoolean(false);
+        CountDownLatch latch = new CountDownLatch(1);
+        MAIN.post(() -> {
+            ChintuAccessibilityService current = active.get();
+            try {
+                result.set(current != null && action.run(current));
+            } catch (RuntimeException ignored) {
+                result.set(false);
+            } finally {
+                latch.countDown();
+            }
+        });
+        try {
+            latch.await(2, TimeUnit.SECONDS);
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+        }
+        return result.get();
     }
 
     private boolean scroll(boolean forward) {
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root != null) {
-            AccessibilityNodeInfo scrollable = findScrollable(root);
+            AccessibilityNodeInfo scrollable = findBestScrollable(root);
             if (scrollable != null) {
                 int action = forward
                         ? AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
@@ -136,18 +177,18 @@ public final class ChintuAccessibilityService extends AccessibilityService {
         int width = getResources().getDisplayMetrics().widthPixels;
         int height = getResources().getDisplayMetrics().heightPixels;
         float y = height * 0.55f;
-        float startX = left ? width * 0.82f : width * 0.18f;
-        float endX = left ? width * 0.18f : width * 0.82f;
-        return dispatchStroke(startX, y, endX, y, 420L);
+        float startX = left ? width * 0.84f : width * 0.16f;
+        float endX = left ? width * 0.16f : width * 0.84f;
+        return dispatchStroke(startX, y, endX, y, 430L);
     }
 
     private boolean dispatchVerticalSwipe(boolean forward) {
         int width = getResources().getDisplayMetrics().widthPixels;
         int height = getResources().getDisplayMetrics().heightPixels;
-        float x = width * 0.5f;
-        float startY = forward ? height * 0.78f : height * 0.30f;
-        float endY = forward ? height * 0.30f : height * 0.78f;
-        return dispatchStroke(x, startY, x, endY, 460L);
+        float x = width * 0.52f;
+        float startY = forward ? height * 0.80f : height * 0.28f;
+        float endY = forward ? height * 0.27f : height * 0.81f;
+        return dispatchStroke(x, startY, x, endY, 500L);
     }
 
     private boolean dispatchStroke(float startX, float startY,
@@ -161,10 +202,32 @@ public final class ChintuAccessibilityService extends AccessibilityService {
         return dispatchGesture(gesture, null, MAIN);
     }
 
+    private boolean focusComposerInternal() {
+        String[] labels = {
+                "What's on your mind", "What’s on your mind", "Write something",
+                "Create post", "New post", "Add a caption", "Caption",
+                "آپ کے ذہن میں کیا ہے", "آپ کیا سوچ رہے ہیں", "کچھ لکھیں",
+                "پوسٹ بنائیں", "نئی پوسٹ", "کیپشن لکھیں",
+                "आपके मन में क्या है", "कुछ लिखें", "पोस्ट बनाएं", "कैप्शन लिखें"
+        };
+        for (String label : labels) {
+            if (clickText(label)) return true;
+        }
+
+        AccessibilityNodeInfo editable = findEditableNode();
+        if (editable != null) {
+            editable.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
+            return editable.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    || editable.isFocused();
+        }
+        return false;
+    }
+
     private boolean setFocusedText(String text, boolean clearOnly) {
         AccessibilityNodeInfo node = findEditableNode();
         if (node == null) return false;
         node.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
+        node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
         Bundle arguments = new Bundle();
         arguments.putCharSequence(
                 AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
@@ -176,6 +239,7 @@ public final class ChintuAccessibilityService extends AccessibilityService {
         AccessibilityNodeInfo node = findEditableNode();
         if (node == null) return false;
         node.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
+        node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
         return node.performAction(AccessibilityNodeInfo.ACTION_PASTE);
     }
 
@@ -187,7 +251,10 @@ public final class ChintuAccessibilityService extends AccessibilityService {
                 return true;
             }
         }
-        String[] labels = {"Enter", "Done", "Go", "Search", "Next", "Send", "انٹر", "تلاش"};
+        String[] labels = {
+                "Enter", "Done", "Go", "Search", "Next", "Send",
+                "انٹر", "تلاش", "بھیجیں", "भेजें", "खोजें"
+        };
         for (String label : labels) {
             if (clickText(label)) return true;
         }
@@ -195,7 +262,8 @@ public final class ChintuAccessibilityService extends AccessibilityService {
     }
 
     private boolean clickText(String requested) {
-        String target = CommandEngine.normalize(requested);
+        String target = CommandEngine.normalize(
+                AccentCommandNormalizer.canonicalize(requested));
         if (target.isEmpty()) return false;
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null) return false;
@@ -207,6 +275,8 @@ public final class ChintuAccessibilityService extends AccessibilityService {
             }
         }
 
+        AccessibilityNodeInfo best = null;
+        int bestScore = 0;
         ArrayDeque<AccessibilityNodeInfo> queue = new ArrayDeque<>();
         queue.add(root);
         while (!queue.isEmpty()) {
@@ -216,27 +286,30 @@ public final class ChintuAccessibilityService extends AccessibilityService {
             String normalizedText = CommandEngine.normalize(text == null ? "" : text.toString());
             String normalizedDescription = CommandEngine.normalize(
                     description == null ? "" : description.toString());
-            if (matchesTarget(target, normalizedText) || matchesTarget(target, normalizedDescription)) {
-                if (clickNodeOrParent(node)) return true;
+            int score = Math.max(matchScore(target, normalizedText),
+                    matchScore(target, normalizedDescription));
+            if (score > bestScore) {
+                best = node;
+                bestScore = score;
             }
             for (int i = 0; i < node.getChildCount(); i++) {
                 AccessibilityNodeInfo child = node.getChild(i);
                 if (child != null) queue.addLast(child);
             }
         }
-        return false;
+        return best != null && bestScore >= 72 && clickNodeOrParent(best);
     }
 
-    private boolean matchesTarget(String target, String candidate) {
-        if (candidate.isEmpty()) return false;
-        return candidate.equals(target)
-                || candidate.contains(target)
-                || target.contains(candidate);
+    private int matchScore(String target, String candidate) {
+        if (candidate.isEmpty()) return 0;
+        if (candidate.equals(target)) return 100;
+        if (candidate.contains(target) || target.contains(candidate)) return 90;
+        return ContactMatcher.similarity(target, candidate);
     }
 
     private boolean clickNodeOrParent(AccessibilityNodeInfo node) {
         AccessibilityNodeInfo current = node;
-        for (int depth = 0; current != null && depth < 6; depth++) {
+        for (int depth = 0; current != null && depth < 8; depth++) {
             if (current.isClickable() && current.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
                 return true;
             }
@@ -268,18 +341,28 @@ public final class ChintuAccessibilityService extends AccessibilityService {
         return firstEditable;
     }
 
-    private AccessibilityNodeInfo findScrollable(AccessibilityNodeInfo root) {
+    private AccessibilityNodeInfo findBestScrollable(AccessibilityNodeInfo root) {
         ArrayDeque<AccessibilityNodeInfo> queue = new ArrayDeque<>();
         queue.add(root);
+        AccessibilityNodeInfo best = null;
+        int bestArea = -1;
+        android.graphics.Rect bounds = new android.graphics.Rect();
         while (!queue.isEmpty()) {
             AccessibilityNodeInfo node = queue.removeFirst();
-            if (node.isScrollable()) return node;
+            if (node.isScrollable()) {
+                node.getBoundsInScreen(bounds);
+                int area = Math.max(0, bounds.width()) * Math.max(0, bounds.height());
+                if (area > bestArea) {
+                    best = node;
+                    bestArea = area;
+                }
+            }
             for (int i = 0; i < node.getChildCount(); i++) {
                 AccessibilityNodeInfo child = node.getChild(i);
                 if (child != null) queue.addLast(child);
             }
         }
-        return null;
+        return best;
     }
 
     private interface ServiceAction {
