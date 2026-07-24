@@ -1,6 +1,7 @@
 package com.zeshan.chintuai;
 
 import android.Manifest;
+import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
 import android.content.BroadcastReceiver;
@@ -33,6 +34,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /** Main Wazir Gen Z command center. */
+@SuppressLint("UnspecifiedRegisterReceiverFlag")
 public final class WazirActivity extends Activity {
     public static final String EXTRA_PENDING_COMMAND = "pending_command";
 
