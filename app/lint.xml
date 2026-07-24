@@ -21,4 +21,13 @@
     <issue id="ObsoleteSdkInt">
         <ignore path="src/main/java/com/zeshan/chintuai/ChintuActivity.java" />
     </issue>
+
+    <!-- RECORD_AUDIO is checked before the foreground service starts. The builder lives in a
+         private API-33-only method, so lint cannot follow the permission and SDK guards. -->
+    <issue id="MissingPermission">
+        <ignore path="src/main/java/com/zeshan/chintuai/HandsFreeVoiceService.java" />
+    </issue>
+    <issue id="UseRequiresApi">
+        <ignore path="src/main/java/com/zeshan/chintuai/HandsFreeVoiceService.java" />
+    </issue>
 </lint>
