@@ -55,29 +55,46 @@ public final class AppCatalog {
     }
 
     public static int scoreName(String first, String second) {
-        return ContactMatcher.similarity(normalizeAppKey(first), normalizeAppKey(second));
+        String left = normalizeAppKey(first);
+        String right = normalizeAppKey(second);
+        if (left.equals(right) && !left.isEmpty()) return 100;
+        if (left.replace(" ", "").equals(right.replace(" ", "")) && !left.isEmpty()) return 99;
+        return ContactMatcher.similarity(left, right);
     }
 
     public static String normalizeAppKey(String text) {
-        return CommandEngine.normalize(text)
-                .replace("واٹس ایپ", "whatsapp")
-                .replace("انسٹاگرام", "instagram")
-                .replace("فیس بک", "facebook")
-                .replace("میسنجر", "messenger")
-                .replace("یوٹیوب", "youtube")
-                .replace("ٹک ٹاک", "tiktok")
-                .replace("ٹیلیگرام", "telegram")
-                .replace("سنیپ چیٹ", "snapchat")
-                .replace("پنٹرسٹ", "pinterest")
-                .replace("کینوا", "canva")
-                .replace("کیپ کٹ", "capcut")
-                .replace("میپس", "maps")
-                .replace("جی میل", "gmail")
-                .replace("کروم", "chrome")
-                .replace("کیلکولیٹر", "calculator")
-                .replace("گیلری", "gallery")
-                .replace("فوٹوز", "photos")
-                .replace("پلے اسٹور", "play store")
+        String normalized = CommandEngine.normalize(
+                AccentCommandNormalizer.canonicalize(text));
+        normalized = replaceAny(normalized, "whatsapp",
+                "واٹس ایپ", "واٹسپ", "واٹساپ", "واٹس اپ", "وٹس ایپ",
+                "whatsapp", "whats app", "watsapp", "whatsap", "whatsup");
+        normalized = replaceAny(normalized, "instagram",
+                "انسٹاگرام", "انسٹا گرام", "instagram", "insta gram");
+        normalized = replaceAny(normalized, "facebook",
+                "فیس بک", "فیسبک", "facebook", "face book");
+        normalized = replaceAny(normalized, "messenger",
+                "میسنجر", "مسینجر", "messenger");
+        normalized = replaceAny(normalized, "youtube",
+                "یوٹیوب", "یو ٹیوب", "youtube", "you tube");
+        normalized = replaceAny(normalized, "tiktok",
+                "ٹک ٹاک", "ٹک ٹوک", "tiktok", "tik tok");
+        normalized = replaceAny(normalized, "telegram",
+                "ٹیلیگرام", "ٹیلی گرام", "telegram", "tele gram");
+        normalized = replaceAny(normalized, "snapchat",
+                "سنیپ چیٹ", "snapchat", "snap chat");
+        normalized = replaceAny(normalized, "pinterest",
+                "پنٹرسٹ", "پینٹرسٹ", "pinterest");
+        normalized = replaceAny(normalized, "canva", "کینوا", "canva");
+        normalized = replaceAny(normalized, "capcut", "کیپ کٹ", "capcut", "cap cut");
+        normalized = replaceAny(normalized, "spotify", "اسپاٹیفائی", "spotify");
+        normalized = replaceAny(normalized, "maps", "گوگل میپس", "میپس", "maps");
+        normalized = replaceAny(normalized, "gmail", "جی میل", "gmail", "g mail");
+        normalized = replaceAny(normalized, "chrome", "کروم", "chrome");
+        normalized = replaceAny(normalized, "calculator", "کیلکولیٹر", "calculator");
+        normalized = replaceAny(normalized, "gallery", "گیلری", "gallery");
+        normalized = replaceAny(normalized, "photos", "فوٹوز", "photos");
+        normalized = replaceAny(normalized, "play store", "پلے اسٹور", "play store");
+        return normalized
                 .replaceAll("[^\\p{L}\\p{N}]+", " ")
                 .replaceAll("\\s+", " ")
                 .trim();
@@ -87,47 +104,71 @@ public final class AppCatalog {
         return APPS;
     }
 
+    private static String replaceAny(String source, String canonical, String... values) {
+        String result = source;
+        for (String value : values) {
+            result = result.replace(CommandEngine.normalize(value), canonical);
+        }
+        return result;
+    }
+
     private static List<AppSpec> buildApps() {
         List<AppSpec> apps = new ArrayList<>();
         apps.add(spec("YouTube", "https://www.youtube.com",
-                packages("com.google.android.youtube"), aliases("یوٹیوب", "youtube")));
+                packages("com.google.android.youtube"),
+                aliases("یوٹیوب", "یو ٹیوب", "यूट्यूब", "youtube", "you tube")));
         apps.add(spec("WhatsApp Business", "https://wa.me/",
-                packages("com.whatsapp.w4b"), aliases("واٹس ایپ بزنس", "whatsapp business")));
+                packages("com.whatsapp.w4b"),
+                aliases("واٹس ایپ بزنس", "व्हाट्सएप बिजनेस", "whatsapp business")));
         apps.add(spec("WhatsApp", "https://wa.me/",
-                packages("com.whatsapp"), aliases("واٹس ایپ", "whatsapp")));
+                packages("com.whatsapp"),
+                aliases("واٹس ایپ", "واٹسپ", "واٹساپ", "واٹس اپ", "وٹس ایپ",
+                        "व्हाट्सएप", "वॉट्सऐप", "वाट्सएप",
+                        "whatsapp", "whats app", "watsapp", "whatsap", "whatsup")));
         apps.add(spec("Instagram", "https://www.instagram.com",
-                packages("com.instagram.android"), aliases("انسٹاگرام", "instagram")));
+                packages("com.instagram.android"),
+                aliases("انسٹاگرام", "انسٹا گرام", "इंस्टाग्राम", "instagram", "insta gram")));
         apps.add(spec("Facebook Lite", "https://m.facebook.com",
-                packages("com.facebook.lite"), aliases("فیس بک لائٹ", "facebook lite")));
+                packages("com.facebook.lite"),
+                aliases("فیس بک لائٹ", "फेसबुक लाइट", "facebook lite")));
         apps.add(spec("Facebook", "https://www.facebook.com",
-                packages("com.facebook.katana"), aliases("فیس بک", "facebook")));
+                packages("com.facebook.katana"),
+                aliases("فیس بک", "فیسبک", "फेसबुक", "facebook", "face book")));
         apps.add(spec("Messenger", "https://www.messenger.com",
-                packages("com.facebook.orca"), aliases("میسنجر", "messenger")));
+                packages("com.facebook.orca"),
+                aliases("میسنجر", "مسینجر", "मैसेंजर", "messenger")));
         apps.add(spec("TikTok", "https://www.tiktok.com",
                 packages("com.zhiliaoapp.musically", "com.ss.android.ugc.trill"),
-                aliases("ٹک ٹاک", "tiktok")));
+                aliases("ٹک ٹاک", "ٹک ٹوک", "टिकटॉक", "tiktok", "tik tok")));
         apps.add(spec("X", "https://x.com",
-                packages("com.twitter.android"), aliases("ایکس", "twitter", "ٹوئٹر", "x")));
+                packages("com.twitter.android"),
+                aliases("ایکس", "twitter", "ٹوئٹر", "ट्विटर", "x")));
         apps.add(spec("Threads", "https://www.threads.net",
                 packages("com.instagram.barcelona"), aliases("تھریڈز", "threads")));
         apps.add(spec("Telegram", "https://telegram.org",
-                packages("org.telegram.messenger"), aliases("ٹیلیگرام", "telegram")));
+                packages("org.telegram.messenger"),
+                aliases("ٹیلیگرام", "ٹیلی گرام", "टेलीग्राम", "telegram", "tele gram")));
         apps.add(spec("Snapchat", "https://www.snapchat.com",
-                packages("com.snapchat.android"), aliases("سنیپ چیٹ", "snapchat")));
+                packages("com.snapchat.android"),
+                aliases("سنیپ چیٹ", "स्नैपचैट", "snapchat", "snap chat")));
         apps.add(spec("Pinterest", "https://www.pinterest.com",
-                packages("com.pinterest"), aliases("پنٹرسٹ", "pinterest")));
+                packages("com.pinterest"),
+                aliases("پنٹرسٹ", "پینٹرسٹ", "पिंटरेस्ट", "pinterest")));
         apps.add(spec("Canva", "https://www.canva.com",
-                packages("com.canva.editor"), aliases("کینوا", "canva")));
+                packages("com.canva.editor"), aliases("کینوا", "कैनवा", "canva")));
         apps.add(spec("CapCut", "https://www.capcut.com",
-                packages("com.lemon.lvoverseas"), aliases("کیپ کٹ", "capcut")));
+                packages("com.lemon.lvoverseas"),
+                aliases("کیپ کٹ", "कैपकट", "capcut", "cap cut")));
         apps.add(spec("Spotify", "https://open.spotify.com",
-                packages("com.spotify.music"), aliases("اسپاٹیفائی", "spotify")));
+                packages("com.spotify.music"), aliases("اسپاٹیفائی", "स्पॉटिफाई", "spotify")));
         apps.add(spec("Google Maps", "https://maps.google.com",
-                packages("com.google.android.apps.maps"), aliases("گوگل میپس", "میپس", "maps")));
+                packages("com.google.android.apps.maps"),
+                aliases("گوگل میپس", "میپس", "गूगल मैप्स", "मैप्स", "maps")));
         apps.add(spec("Gmail", "https://mail.google.com",
-                packages("com.google.android.gm"), aliases("جی میل", "gmail", "ای میل")));
+                packages("com.google.android.gm"),
+                aliases("جی میل", "जीमेल", "gmail", "g mail", "ای میل")));
         apps.add(spec("Chrome", "https://www.google.com",
-                packages("com.android.chrome"), aliases("کروم", "chrome", "براؤزر", "browser")));
+                packages("com.android.chrome"), aliases("کروم", "क्रोम", "chrome", "براؤزر", "browser")));
         apps.add(spec("Mi Browser", "https://www.google.com",
                 packages("com.mi.globalbrowser"), aliases("ایم آئی براؤزر", "mi browser")));
         apps.add(spec("Gallery", null,
