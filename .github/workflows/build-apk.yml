@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 concurrency:
   group: wazir-android-${{ github.ref }}
@@ -20,6 +21,18 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      - name: Report CI start
+        if: github.ref == 'refs/heads/fix/wazir-voice-turn-gate-4.0.1'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: 13,
+              body: `Wazir 4.0.1 CI started — run ${context.runId}, commit ${context.sha}.`
+            })
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -50,6 +63,7 @@ jobs:
           fi
 
       - name: Unit tests, lint and APK
+        id: android_build
         run: gradle clean testDebugUnitTest lintDebug assembleDebug --stacktrace --no-daemon
 
       - name: Verify APK exists
@@ -80,3 +94,16 @@ jobs:
           path: app/build/reports/lint-results-debug.html
           if-no-files-found: ignore
           retention-days: 14
+
+      - name: Report CI result
+        if: always() && github.ref == 'refs/heads/fix/wazir-voice-turn-gate-4.0.1'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const outcome = '${{ steps.android_build.outcome }}';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: 13,
+              body: `Wazir 4.0.1 CI finished — run ${context.runId}; Android build outcome: **${outcome}**; commit ${context.sha}.`
+            })
