@@ -59,6 +59,9 @@ public final class BackgroundCommandExecutor {
     }
 
     public static Result execute(Context context, String raw) {
+        Result automation = JarvisAutomationExecutor.tryExecute(context, raw);
+        if (automation != null) return automation;
+
         CommandEngine.ParsedCommand command = CommandEngine.parse(raw);
         switch (command.type) {
             case HANDS_FREE_OFF:
