@@ -11,11 +11,10 @@ import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-/** Pure-Java command parsing so routing can be unit-tested without Android. */
+/** Pure-Java Urdu/English command parser shared by button and hands-free voice modes. */
 public final class CommandEngine {
     private static final Pattern PHONE_PATTERN =
             Pattern.compile("\\+?[0-9][0-9\\s-]{6,18}[0-9]");
-
     private static final Map<String, Integer> NUMBER_WORDS = buildNumberWords();
 
     private CommandEngine() {
@@ -24,6 +23,8 @@ public final class CommandEngine {
     public enum Type {
         BLOCKED_FINANCIAL,
         HELP,
+        HANDS_FREE_ON,
+        HANDS_FREE_OFF,
         TIME,
         DATE,
         TORCH_ON,
@@ -39,6 +40,24 @@ public final class CommandEngine {
         WEATHER,
         GOOGLE_SEARCH,
         MAP_SEARCH,
+        VOLUME_UP,
+        VOLUME_DOWN,
+        VOLUME_MUTE,
+        VOLUME_MAX,
+        MEDIA_PLAY_PAUSE,
+        MEDIA_NEXT,
+        MEDIA_PREVIOUS,
+        MEDIA_STOP,
+        BRIGHTNESS_UP,
+        BRIGHTNESS_DOWN,
+        BRIGHTNESS_MAX,
+        GLOBAL_HOME,
+        GLOBAL_BACK,
+        GLOBAL_RECENTS,
+        GLOBAL_NOTIFICATIONS,
+        GLOBAL_QUICK_SETTINGS,
+        GLOBAL_LOCK,
+        GLOBAL_SCREENSHOT,
         OPEN_CONTACTS,
         OPEN_DIALER,
         OPEN_MESSAGES,
@@ -48,8 +67,12 @@ public final class CommandEngine {
         OPEN_GALLERY,
         OPEN_WIFI,
         OPEN_BLUETOOTH,
+        OPEN_MOBILE_DATA,
         OPEN_SETTINGS,
         OPEN_PLAY_STORE,
+        OPEN_CALENDAR,
+        OPEN_CLOCK,
+        OPEN_FILES,
         OPEN_APP,
         UNKNOWN
     }
@@ -78,18 +101,88 @@ public final class CommandEngine {
 
     public static ParsedCommand parse(String rawInput) {
         String raw = rawInput == null ? "" : rawInput.trim();
-        String command = normalize(raw);
+        String command = normalize(stripWakeWord(raw));
         if (command.isEmpty()) return new ParsedCommand(Type.UNKNOWN, raw, "");
 
         if (containsAny(command,
                 "بینک", "bank", "ایزی پیسہ", "easypaisa", "جاز کیش", "jazzcash",
                 "رقم ٹرانسفر", "پیسے بھیجو", "ادائیگی کرو", "payment", "transfer money",
-                "پاس ورڈ بدل", "password change")) {
+                "پاس ورڈ بدل", "password change", "پن بدل", "change pin")) {
             return new ParsedCommand(Type.BLOCKED_FINANCIAL, raw, "");
         }
 
-        if (containsAny(command, "مدد", "کیا کر سکتے ہو", "help", "commands")) {
+        if (containsAny(command,
+                "ہینڈز فری بند", "ہینڈ فری بند", "ہمیشہ سننا بند", "مائیک بند کرو",
+                "hands free off", "stop listening always")) {
+            return new ParsedCommand(Type.HANDS_FREE_OFF, raw, "");
+        }
+        if (containsAny(command,
+                "ہینڈز فری چالو", "ہینڈ فری چالو", "ہمیشہ سنو", "مائیک ہمیشہ آن",
+                "hands free on", "always listen")) {
+            return new ParsedCommand(Type.HANDS_FREE_ON, raw, "");
+        }
+
+        if (containsAny(command, "مدد", "کیا کر سکتے ہو", "تمام کمانڈ", "help", "commands")) {
             return new ParsedCommand(Type.HELP, raw, "");
+        }
+
+        if (containsAny(command, "ہوم اسکرین", "گھر کی اسکرین", "home screen", "گھر جاؤ")) {
+            return new ParsedCommand(Type.GLOBAL_HOME, raw, "");
+        }
+        if (containsAny(command, "واپس جاؤ", "پیچھے جاؤ", "بیک کرو", "go back")) {
+            return new ParsedCommand(Type.GLOBAL_BACK, raw, "");
+        }
+        if (containsAny(command, "حالیہ ایپس", "ریسنٹ ایپس", "recent apps", "ملٹی ٹاسک")) {
+            return new ParsedCommand(Type.GLOBAL_RECENTS, raw, "");
+        }
+        if (containsAny(command, "نوٹیفکیشن کھولو", "اطلاعات کھولو", "notification shade")) {
+            return new ParsedCommand(Type.GLOBAL_NOTIFICATIONS, raw, "");
+        }
+        if (containsAny(command, "کوئیک سیٹنگ", "فوری سیٹنگ", "quick settings")) {
+            return new ParsedCommand(Type.GLOBAL_QUICK_SETTINGS, raw, "");
+        }
+        if (containsAny(command, "فون لاک", "اسکرین لاک", "lock screen")) {
+            return new ParsedCommand(Type.GLOBAL_LOCK, raw, "");
+        }
+        if (containsAny(command, "اسکرین شاٹ", "screenshot")) {
+            return new ParsedCommand(Type.GLOBAL_SCREENSHOT, raw, "");
+        }
+
+        if (containsAny(command, "آواز تیز", "والیوم بڑھ", "volume up")) {
+            return new ParsedCommand(Type.VOLUME_UP, raw, "");
+        }
+        if (containsAny(command, "آواز کم", "والیوم کم", "volume down")) {
+            return new ParsedCommand(Type.VOLUME_DOWN, raw, "");
+        }
+        if (containsAny(command, "آواز بند", "والیوم بند", "میوٹ", "mute")) {
+            return new ParsedCommand(Type.VOLUME_MUTE, raw, "");
+        }
+        if (containsAny(command, "آواز فل", "والیوم فل", "زیادہ سے زیادہ آواز", "max volume")) {
+            return new ParsedCommand(Type.VOLUME_MAX, raw, "");
+        }
+        if (containsAny(command, "اگلا گانا", "اگلی ویڈیو", "next song", "next track")) {
+            return new ParsedCommand(Type.MEDIA_NEXT, raw, "");
+        }
+        if (containsAny(command, "پچھلا گانا", "پچھلی ویڈیو", "previous song", "previous track")) {
+            return new ParsedCommand(Type.MEDIA_PREVIOUS, raw, "");
+        }
+        if (containsAny(command, "میوزک بند", "گانا بند", "media stop", "stop music")) {
+            return new ParsedCommand(Type.MEDIA_STOP, raw, "");
+        }
+        if (containsAny(command,
+                "گانا چلاؤ", "گانا روکو", "میوزک چلاؤ", "میوزک روکو",
+                "پلے کرو", "پاز کرو", "play music", "pause music", "play pause")) {
+            return new ParsedCommand(Type.MEDIA_PLAY_PAUSE, raw, "");
+        }
+
+        if (containsAny(command, "روشنی تیز", "برائٹنس بڑھ", "brightness up")) {
+            return new ParsedCommand(Type.BRIGHTNESS_UP, raw, "");
+        }
+        if (containsAny(command, "روشنی کم", "برائٹنس کم", "brightness down")) {
+            return new ParsedCommand(Type.BRIGHTNESS_DOWN, raw, "");
+        }
+        if (containsAny(command, "روشنی فل", "برائٹنس فل", "max brightness")) {
+            return new ParsedCommand(Type.BRIGHTNESS_MAX, raw, "");
         }
 
         if (containsAny(command, "کانٹیکٹس کھولو", "رابطے کھولو", "contacts کھولو")) {
@@ -121,6 +214,18 @@ public final class CommandEngine {
         }
         if (containsAny(command, "بلوٹوتھ", "bluetooth")) {
             return new ParsedCommand(Type.OPEN_BLUETOOTH, raw, "");
+        }
+        if (containsAny(command, "موبائل ڈیٹا", "mobile data", "سم انٹرنیٹ")) {
+            return new ParsedCommand(Type.OPEN_MOBILE_DATA, raw, "");
+        }
+        if (containsAny(command, "کیلنڈر", "calendar")) {
+            return new ParsedCommand(Type.OPEN_CALENDAR, raw, "کیلنڈر");
+        }
+        if (containsAny(command, "گھڑی کھولو", "کلاک کھولو", "clock app")) {
+            return new ParsedCommand(Type.OPEN_CLOCK, raw, "گھڑی");
+        }
+        if (containsAny(command, "فائلز", "فائل مینیجر", "files", "file manager")) {
+            return new ParsedCommand(Type.OPEN_FILES, raw, "فائلز");
         }
         if (containsAny(command, "پلے اسٹور", "play store")) {
             return new ParsedCommand(Type.OPEN_PLAY_STORE, raw, "پلے اسٹور");
@@ -219,6 +324,19 @@ public final class CommandEngine {
         return new ParsedCommand(Type.UNKNOWN, raw, raw);
     }
 
+    public static boolean hasWakeWord(String raw) {
+        String text = normalize(raw);
+        return text.startsWith("چنٹو") || text.startsWith("چنتو")
+                || text.startsWith("chintu");
+    }
+
+    public static String stripWakeWord(String raw) {
+        String text = normalize(raw);
+        return text
+                .replaceFirst("^(چنٹو|چنتو|chintu)(\\s+جی|\\s+سنو|\\s+بھائی)?\\s*", "")
+                .trim();
+    }
+
     private static boolean isContactLookup(String command) {
         return containsAny(command,
                 "فون ڈائریکٹری", "کانٹیکٹ", "کانٹیکٹس", "رابطہ", "رابطوں")
@@ -236,6 +354,7 @@ public final class CommandEngine {
                 || parsed.type == Type.CONTACT_LOOKUP) score += 18;
         if (parsed.type == Type.WEATHER || parsed.type == Type.GOOGLE_SEARCH
                 || parsed.type == Type.YOUTUBE_SEARCH || parsed.type == Type.MAP_SEARCH) score += 14;
+        if (hasWakeWord(raw)) score += 12;
         if (!parsed.argument.isEmpty()) score += Math.min(12, parsed.argument.length());
         return score;
     }
@@ -264,12 +383,11 @@ public final class CommandEngine {
                 .replace('ك', 'ک')
                 .replace('ۀ', 'ہ')
                 .replace('ة', 'ہ');
-        normalized = normalizeDigits(normalized)
+        return normalizeDigits(normalized)
                 .replaceAll("[\\u064B-\\u065F\\u0670]", "")
                 .replaceAll("[،,۔.!?؛:()\\[\\]{}\"'`~]", " ")
                 .replaceAll("\\s+", " ")
                 .trim();
-        return normalized;
     }
 
     public static String normalizeDigits(String text) {
@@ -302,7 +420,7 @@ public final class CommandEngine {
     }
 
     public static String extractContactName(String raw) {
-        String cleaned = normalize(raw);
+        String cleaned = normalize(stripWakeWord(raw));
         String[] stopWords = {
                 "میری", "میرے", "میرا", "فون", "ڈائریکٹری", "میں", "سے",
                 "کا", "کی", "کے", "نمبر", "نکالو", "تلاش", "کرو", "کر", "دو",
@@ -332,7 +450,7 @@ public final class CommandEngine {
     }
 
     public static String cleanQuery(String raw, String... phrases) {
-        String result = normalize(raw);
+        String result = normalize(stripWakeWord(raw));
         for (String phrase : phrases) {
             result = result.replace(normalize(phrase), " ");
         }
@@ -343,7 +461,6 @@ public final class CommandEngine {
         String text = replaceNumberWords(normalize(raw));
         int hour = -1;
         int minute = 0;
-
         Matcher colon = Pattern.compile("\\b([0-2]?\\d)\\s*[:.]\\s*([0-5]?\\d)\\b")
                 .matcher(text);
         if (colon.find()) {
@@ -351,7 +468,6 @@ public final class CommandEngine {
             minute = parseSafeInt(colon.group(2), 0);
         }
         if (hour < 0) hour = findFirstNumber(text);
-
         if (containsAny(text, "ساڑھے")) {
             minute = 30;
         } else if (containsAny(text, "سوا")) {
@@ -360,7 +476,6 @@ public final class CommandEngine {
             hour -= 1;
             minute = 45;
         }
-
         if (hour < 0) return null;
         boolean pm = containsAny(text, "شام", "رات", "دوپہر", "pm");
         boolean am = containsAny(text, "صبح", "فجر", "am");
@@ -377,7 +492,6 @@ public final class CommandEngine {
         total += sumUnits(text, "منٹ|منٹوں|minute|minutes", 60);
         total += sumUnits(text, "سیکنڈ|سیکنڈز|second|seconds", 1);
         if (total > 0) return total;
-
         int value = findFirstNumber(text);
         if (value < 0) return 0;
         if (containsAny(text, "گھنٹہ", "گھنٹے", "hour")) return value * 3600;

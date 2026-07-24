@@ -1,6 +1,7 @@
 package com.zeshan.chintuai;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import org.junit.Test;
@@ -19,6 +20,42 @@ public class CommandEngineTest {
         CommandEngine.ParsedCommand command = CommandEngine.parse("ہوم کو کال کرو");
         assertEquals(CommandEngine.Type.CALL, command.type);
         assertEquals("ہوم", command.argument);
+    }
+
+    @Test
+    public void stripsWakeWordAndKeepsCommand() {
+        assertTrue(CommandEngine.hasWakeWord("چنٹو ہوم کو کال کرو"));
+        assertEquals("ہوم کو کال کرو",
+                CommandEngine.stripWakeWord("چنٹو جی ہوم کو کال کرو"));
+        assertEquals(CommandEngine.Type.CALL,
+                CommandEngine.parse("چنٹو ہوم کو کال کرو").type);
+        assertFalse(CommandEngine.hasWakeWord("ہوم کو کال کرو"));
+    }
+
+    @Test
+    public void parsesFullPhoneControls() {
+        assertEquals(CommandEngine.Type.GLOBAL_HOME,
+                CommandEngine.parse("ہوم اسکرین کھولو").type);
+        assertEquals(CommandEngine.Type.GLOBAL_BACK,
+                CommandEngine.parse("واپس جاؤ").type);
+        assertEquals(CommandEngine.Type.GLOBAL_NOTIFICATIONS,
+                CommandEngine.parse("نوٹیفکیشن کھولو").type);
+        assertEquals(CommandEngine.Type.GLOBAL_SCREENSHOT,
+                CommandEngine.parse("اسکرین شاٹ لو").type);
+        assertEquals(CommandEngine.Type.VOLUME_UP,
+                CommandEngine.parse("آواز تیز کرو").type);
+        assertEquals(CommandEngine.Type.MEDIA_NEXT,
+                CommandEngine.parse("اگلا گانا چلاؤ").type);
+        assertEquals(CommandEngine.Type.BRIGHTNESS_DOWN,
+                CommandEngine.parse("روشنی کم کرو").type);
+    }
+
+    @Test
+    public void parsesHandsFreeCommands() {
+        assertEquals(CommandEngine.Type.HANDS_FREE_ON,
+                CommandEngine.parse("ہینڈز فری چالو کرو").type);
+        assertEquals(CommandEngine.Type.HANDS_FREE_OFF,
+                CommandEngine.parse("چنٹو ہینڈز فری بند کرو").type);
     }
 
     @Test

@@ -11,14 +11,17 @@ public class ContactMatcherTest {
         assertEquals("home", ContactMatcher.normalizeContactKey("ہوم"));
         assertEquals("home", ContactMatcher.normalizeContactKey("ھوم"));
         assertEquals("home", ContactMatcher.normalizeContactKey("ہم"));
+        assertEquals("home", ContactMatcher.normalizeContactKey("گھر"));
     }
 
     @Test
-    public void realNameMatchOutranksGenericHomePhoneLabel() {
+    public void exactHomeDoesNotMatchHotelOrGenericPhoneLabel() {
         int namedHome = ContactMatcher.score("ہوم", "Home", "Mobile");
+        int hotel = ContactMatcher.score("ہوم", "Hotel Awan", "Mobile");
         int unrelatedHomeLabel = ContactMatcher.score("ہوم", "Ali", "Home");
         assertEquals(100, namedHome);
-        assertTrue(unrelatedHomeLabel < 58);
+        assertTrue(hotel < ContactMatcher.minimumAcceptedScore("ہوم"));
+        assertTrue(unrelatedHomeLabel < ContactMatcher.minimumAcceptedScore("ہوم"));
     }
 
     @Test

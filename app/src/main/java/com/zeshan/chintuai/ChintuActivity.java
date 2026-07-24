@@ -4,28 +4,24 @@ import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
+import android.content.BroadcastReceiver;
 import android.content.ClipData;
 import android.content.ClipboardManager;
-import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
-import android.content.pm.ResolveInfo;
 import android.database.Cursor;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
-import android.hardware.camera2.CameraAccessException;
-import android.hardware.camera2.CameraCharacteristics;
-import android.hardware.camera2.CameraManager;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
-import android.provider.AlarmClock;
 import android.provider.ContactsContract;
-import android.provider.MediaStore;
 import android.provider.Settings;
 import android.speech.RecognizerIntent;
 import android.speech.tts.TextToSpeech;
@@ -45,11 +41,9 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -61,15 +55,19 @@ import java.util.concurrent.Executors;
 public final class ChintuActivity extends Activity
         implements TextToSpeech.OnInitListener, VoiceRecognitionController.Callback {
 
+    public static final String EXTRA_PENDING_COMMAND = "pending_command";
+
     private static final String TAG = "ChintuActivity";
     private static final int REQUEST_MICROPHONE = 4101;
     private static final int REQUEST_CONTACTS = 4102;
     private static final int REQUEST_CAMERA = 4103;
-    private static final int REQUEST_SYSTEM_SPEECH = 4104;
+    private static final int REQUEST_CALL_PHONE = 4104;
+    private static final int REQUEST_SYSTEM_SPEECH = 4105;
+    private static final int REQUEST_HANDS_FREE = 4106;
 
     private static final String PREFS = "chintu_preferences";
     private static final String PREF_HISTORY = "command_history";
-    private static final int MAX_HISTORY = 8;
+    private static final int MAX_HISTORY = 10;
 
     private static final int COLOR_BACKGROUND_TOP = Color.rgb(5, 13, 25);
     private static final int COLOR_BACKGROUND_BOTTOM = Color.rgb(12, 29, 48);
@@ -82,8 +80,10 @@ public final class ChintuActivity extends Activity
     private static final int COLOR_SUCCESS = Color.rgb(87, 211, 151);
     private static final int COLOR_WARNING = Color.rgb(255, 190, 86);
 
+    private static volatile boolean appVisible;
+
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private final ExecutorService contactExecutor = Executors.newSingleThreadExecutor();
+    private final ExecutorService worker = Executors.newSingleThreadExecutor();
 
     private TextView statusView;
     private TextView heardView;
@@ -92,28 +92,59 @@ public final class ChintuActivity extends Activity
     private Button micButton;
     private Button stopButton;
     private Button fallbackVoiceButton;
+    private Button handsFreeButton;
+    private Button accessibilityButton;
 
     private TextToSpeech tts;
     private boolean ttsReady;
     private VoiceRecognitionController voiceController;
-    private boolean awaitingSystemSpeech;
     private boolean destroyed;
     private int contactGeneration;
-
     private String pendingCommand;
     private PendingPermission pendingPermission = PendingPermission.NONE;
+    private boolean receiverRegistered;
+
+    private final BroadcastReceiver handsFreeReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (intent == null) return;
+            String action = intent.getAction();
+            if (HandsFreeVoiceService.ACTION_STATUS.equals(action)) {
+                String status = intent.getStringExtra(HandsFreeVoiceService.EXTRA_STATUS);
+                String detail = intent.getStringExtra(HandsFreeVoiceService.EXTRA_DETAIL);
+                updateStatus(status, detail, COLOR_ACCENT);
+            } else if (HandsFreeVoiceService.ACTION_COMMAND.equals(action)) {
+                String command = intent.getStringExtra(HandsFreeVoiceService.EXTRA_COMMAND);
+                String result = intent.getStringExtra(HandsFreeVoiceService.EXTRA_RESULT);
+                if (command != null && !command.trim().isEmpty()) {
+                    commandInput.setText(command);
+                    addHistory(command);
+                }
+                if (result != null && !result.trim().isEmpty()) {
+                    updateStatus("مکمل", result, COLOR_SUCCESS);
+                }
+                updateHandsFreeUi();
+            }
+        }
+    };
 
     private enum PendingPermission {
         NONE,
         VOICE,
+        HANDS_FREE,
         CONTACT_COMMAND,
+        CALL_COMMAND,
         TORCH_COMMAND
     }
 
     private enum ContactAction {
         SHOW,
-        DIAL,
+        CALL,
         MESSAGE
+    }
+
+    public static boolean isAppVisible() {
+        return appVisible;
     }
 
     @Override
@@ -124,8 +155,30 @@ public final class ChintuActivity extends Activity
         tts = new TextToSpeech(this, this);
         voiceController = new VoiceRecognitionController(this, this);
         setContentView(buildInterface());
+        registerHandsFreeReceiver();
         showHistory();
-        updateStatus("تیار ہوں", "کمانڈ بولیں یا نیچے لکھیں", COLOR_SUCCESS);
+        updateHandsFreeUi();
+        updateAccessibilityUi();
+        updateStatus("تیار ہوں", "بٹن دبائیں یا ہینڈز فری موڈ چلائیں", COLOR_SUCCESS);
+        handlePendingIntent(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handlePendingIntent(intent);
+    }
+
+    private void handlePendingIntent(Intent intent) {
+        if (intent == null) return;
+        String command = intent.getStringExtra(EXTRA_PENDING_COMMAND);
+        if (command == null || command.trim().isEmpty()) return;
+        intent.removeExtra(EXTRA_PENDING_COMMAND);
+        mainHandler.post(() -> {
+            commandInput.setText(command);
+            executeCommand(command);
+        });
     }
 
     private ScrollView buildInterface() {
@@ -159,13 +212,13 @@ public final class ChintuActivity extends Activity
         titleColumn.addView(title, matchWrap());
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("آپ کا ذاتی موبائل اسسٹنٹ");
+        subtitle.setText("ہینڈز فری موبائل اسسٹنٹ");
         subtitle.setTextColor(COLOR_MUTED);
         subtitle.setTextSize(16);
         titleColumn.addView(subtitle, matchWrap());
 
         TextView versionBadge = new TextView(this);
-        versionBadge.setText("STABLE " + BuildConfig.VERSION_NAME);
+        versionBadge.setText("VOICE " + BuildConfig.VERSION_NAME);
         versionBadge.setTextColor(Color.WHITE);
         versionBadge.setTextSize(11);
         versionBadge.setGravity(Gravity.CENTER);
@@ -203,16 +256,33 @@ public final class ChintuActivity extends Activity
         micButton.setTextSize(21);
         micButton.setTypeface(Typeface.DEFAULT_BOLD);
         micButton.setBackground(roundedBackground(COLOR_ACCENT_DARK, dp(24), 1, COLOR_ACCENT));
-        micButton.setContentDescription("وائس کمانڈ شروع کریں");
         micButton.setOnClickListener(v -> {
             v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
-            if (voiceController.isActive()) voiceController.cancel("سننا روک دیا");
-            else startVoiceRecognition();
+            if (HandsFreeVoiceService.isEnabled(this)) {
+                updateStatus("ہینڈز فری چل رہا ہے",
+                        "بٹن کی ضرورت نہیں، سیدھا کمانڈ بولیں", COLOR_SUCCESS);
+            } else if (voiceController.isActive()) {
+                voiceController.cancel("سننا روک دیا");
+            } else {
+                startVoiceRecognition();
+            }
         });
         LinearLayout.LayoutParams micParams = matchWrap();
         micParams.height = dp(68);
         micParams.topMargin = dp(18);
         root.addView(micButton, micParams);
+
+        handsFreeButton = new Button(this);
+        handsFreeButton.setAllCaps(false);
+        handsFreeButton.setTextColor(Color.WHITE);
+        handsFreeButton.setTextSize(17);
+        handsFreeButton.setTypeface(Typeface.DEFAULT_BOLD);
+        handsFreeButton.setBackground(roundedBackground(COLOR_CARD_LIGHT, dp(20), 1, COLOR_ACCENT));
+        handsFreeButton.setOnClickListener(v -> toggleHandsFree());
+        LinearLayout.LayoutParams handsParams = matchWrap();
+        handsParams.height = dp(58);
+        handsParams.topMargin = dp(10);
+        root.addView(handsFreeButton, handsParams);
 
         LinearLayout voiceControls = new LinearLayout(this);
         voiceControls.setOrientation(LinearLayout.HORIZONTAL);
@@ -226,9 +296,24 @@ public final class ChintuActivity extends Activity
         stopButton.setOnClickListener(v -> voiceController.cancel("سننا روک دیا"));
         voiceControls.addView(stopButton, weightedButtonParams());
 
-        fallbackVoiceButton = secondaryButton("متبادل وائس");
-        fallbackVoiceButton.setOnClickListener(v -> launchSystemRecognizer(createSpeechIntent()));
+        fallbackVoiceButton = secondaryButton("Google وائس");
+        fallbackVoiceButton.setOnClickListener(v -> launchSystemRecognizer(
+                voiceController.createRecognitionIntent()));
         voiceControls.addView(fallbackVoiceButton, weightedButtonParams());
+
+        accessibilityButton = secondaryButton("فون کنٹرول آن کریں");
+        accessibilityButton.setOnClickListener(v -> openAccessibilitySettings());
+        LinearLayout.LayoutParams accessParams = matchWrap();
+        accessParams.height = dp(48);
+        accessParams.topMargin = dp(8);
+        root.addView(accessibilityButton, accessParams);
+
+        Button batteryButton = secondaryButton("Redmi بیٹری پابندی ہٹائیں");
+        batteryButton.setOnClickListener(v -> openBatterySettings());
+        LinearLayout.LayoutParams batteryParams = matchWrap();
+        batteryParams.height = dp(46);
+        batteryParams.topMargin = dp(6);
+        root.addView(batteryButton, batteryParams);
 
         LinearLayout inputCard = new LinearLayout(this);
         inputCard.setOrientation(LinearLayout.VERTICAL);
@@ -272,27 +357,35 @@ public final class ChintuActivity extends Activity
         runParams.topMargin = dp(8);
         inputCard.addView(runButton, runParams);
 
-        TextView quickTitle = sectionTitle("فوری کام");
-        LinearLayout.LayoutParams quickTitleParams = matchWrap();
-        quickTitleParams.topMargin = dp(22);
-        root.addView(quickTitle, quickTitleParams);
+        addGridSection(root, "فوری کام", new String[][]{
+                {"📞 ہوم کو کال", "ہوم کو کال کرو"},
+                {"🌤️ موسم", "آج حسن ابدال کا موسم تلاش کرو"},
+                {"▶️ یوٹیوب", "یوٹیوب کھولو"},
+                {"💬 واٹس ایپ", "واٹس ایپ کھولو"},
+                {"📍 میپس", "گوگل میپس کھولو"},
+                {"📷 کیمرہ", "کیمرہ کھولو"},
+                {"⏱️ ٹائمر", "پانچ منٹ کا ٹائمر لگاؤ"},
+                {"🔦 ٹارچ", "ٹارچ آن کرو"}
+        });
 
-        GridLayout quickGrid = new GridLayout(this);
-        quickGrid.setColumnCount(2);
-        quickGrid.setAlignmentMode(GridLayout.ALIGN_BOUNDS);
-        quickGrid.setUseDefaultMargins(false);
-        LinearLayout.LayoutParams gridParams = matchWrap();
-        gridParams.topMargin = dp(8);
-        root.addView(quickGrid, gridParams);
-
-        addQuickAction(quickGrid, "🌤️ موسم", "آج حسن ابدال کا موسم تلاش کرو");
-        addQuickAction(quickGrid, "📞 ہوم کو کال", "ہوم کو کال کرو");
-        addQuickAction(quickGrid, "▶️ یوٹیوب", "یوٹیوب کھولو");
-        addQuickAction(quickGrid, "💬 واٹس ایپ", "واٹس ایپ کھولو");
-        addQuickAction(quickGrid, "📍 میپس", "گوگل میپس کھولو");
-        addQuickAction(quickGrid, "📷 کیمرہ", "کیمرہ کھولو");
-        addQuickAction(quickGrid, "⏱️ ٹائمر", "پانچ منٹ کا ٹائمر لگاؤ");
-        addQuickAction(quickGrid, "🔦 ٹارچ", "ٹارچ آن کرو");
+        addGridSection(root, "پورا فون کنٹرول", new String[][]{
+                {"🏠 ہوم اسکرین", "ہوم اسکرین کھولو"},
+                {"↩️ واپس", "واپس جاؤ"},
+                {"▣ حالیہ ایپس", "حالیہ ایپس کھولو"},
+                {"🔔 نوٹیفکیشن", "نوٹیفکیشن کھولو"},
+                {"⚙️ کوئیک سیٹنگ", "کوئیک سیٹنگ کھولو"},
+                {"🔒 فون لاک", "فون لاک کرو"},
+                {"📸 اسکرین شاٹ", "اسکرین شاٹ لو"},
+                {"🔊 آواز تیز", "آواز تیز کرو"},
+                {"🔉 آواز کم", "آواز کم کرو"},
+                {"⏯️ پلے/پاز", "میوزک پلے یا پاز کرو"},
+                {"⏭️ اگلا گانا", "اگلا گانا چلاؤ"},
+                {"☀️ روشنی تیز", "روشنی تیز کرو"},
+                {"📶 انٹرنیٹ", "وائی فائی کھولو"},
+                {"🟦 بلوٹوتھ", "بلوٹوتھ کھولو"},
+                {"🗓️ کیلنڈر", "کیلنڈر کھولو"},
+                {"📁 فائلز", "فائلز کھولو"}
+        });
 
         LinearLayout historyHeader = new LinearLayout(this);
         historyHeader.setOrientation(LinearLayout.HORIZONTAL);
@@ -305,10 +398,9 @@ public final class ChintuActivity extends Activity
         historyHeader.addView(historyTitle, new LinearLayout.LayoutParams(
                 0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
-        Button clearHistory = secondaryButton("صاف کریں");
-        clearHistory.setOnClickListener(v -> clearHistory());
-        LinearLayout.LayoutParams clearParams = new LinearLayout.LayoutParams(dp(100), dp(42));
-        historyHeader.addView(clearHistory, clearParams);
+        Button helpButton = secondaryButton("تمام کمانڈز");
+        helpButton.setOnClickListener(v -> showHelp());
+        historyHeader.addView(helpButton, new LinearLayout.LayoutParams(dp(130), dp(42)));
 
         historyView = new TextView(this);
         historyView.setTextColor(COLOR_MUTED);
@@ -321,17 +413,37 @@ public final class ChintuActivity extends Activity
         historyParams.topMargin = dp(8);
         root.addView(historyView, historyParams);
 
+        Button clearHistory = secondaryButton("ہسٹری صاف کریں");
+        clearHistory.setOnClickListener(v -> clearHistory());
+        LinearLayout.LayoutParams clearParams = matchWrap();
+        clearParams.height = dp(44);
+        clearParams.topMargin = dp(7);
+        root.addView(clearHistory, clearParams);
+
         TextView hint = new TextView(this);
-        hint.setText("وائس رک جائے تو چنٹو خود دوبارہ کوشش کرے گا اور پھر Google وائس ونڈو کھولے گا۔ نامعلوم کمانڈ گوگل پر تلاش ہوگی۔");
+        hint.setText("ہینڈز فری آن ہو تو ایپ کے اندر سیدھا کمانڈ بولیں۔ دوسری ایپس یا اسکرین آف ہونے پر پہلے ‘چنٹو’ کہیں، پھر کمانڈ بولیں۔");
         hint.setTextColor(COLOR_MUTED);
         hint.setTextSize(13);
         hint.setGravity(Gravity.CENTER);
         hint.setPadding(dp(10), dp(12), dp(10), 0);
-        LinearLayout.LayoutParams hintParams = matchWrap();
-        hintParams.topMargin = dp(8);
-        root.addView(hint, hintParams);
+        root.addView(hint, matchWrap());
 
         return scrollView;
+    }
+
+    private void addGridSection(LinearLayout root, String title, String[][] actions) {
+        TextView section = sectionTitle(title);
+        LinearLayout.LayoutParams titleParams = matchWrap();
+        titleParams.topMargin = dp(22);
+        root.addView(section, titleParams);
+        GridLayout grid = new GridLayout(this);
+        grid.setColumnCount(2);
+        grid.setAlignmentMode(GridLayout.ALIGN_BOUNDS);
+        grid.setUseDefaultMargins(false);
+        LinearLayout.LayoutParams gridParams = matchWrap();
+        gridParams.topMargin = dp(8);
+        root.addView(grid, gridParams);
+        for (String[] action : actions) addQuickAction(grid, action[0], action[1]);
     }
 
     private Button secondaryButton(String text) {
@@ -365,7 +477,7 @@ public final class ChintuActivity extends Activity
         button.setAllCaps(false);
         button.setText(label);
         button.setTextColor(COLOR_TEXT);
-        button.setTextSize(15);
+        button.setTextSize(14);
         button.setBackground(roundedBackground(COLOR_CARD_LIGHT, dp(18), 1, COLOR_ACCENT_DARK));
         button.setOnClickListener(v -> {
             commandInput.setText(command);
@@ -401,196 +513,178 @@ public final class ChintuActivity extends Activity
         voiceController.start();
     }
 
-    private Intent createSpeechIntent() {
-        Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
-        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,
-                RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
-        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ur-PK");
-        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "ur-PK");
-        intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 10);
-        intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
-        intent.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false);
-        intent.putExtra(RecognizerIntent.EXTRA_PROMPT, "چنٹو کو حکم بولیں");
-        return intent;
-    }
-
     private void launchSystemRecognizer(Intent intent) {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
                 != PackageManager.PERMISSION_GRANTED) {
             pendingPermission = PendingPermission.VOICE;
             requestPermission(Manifest.permission.RECORD_AUDIO, REQUEST_MICROPHONE,
-                    "وائس کمانڈ کے لیے مائیکروفون کی اجازت درکار ہے");
+                    "Google وائس کے لیے مائیکروفون کی اجازت درکار ہے");
             return;
         }
         try {
-            awaitingSystemSpeech = true;
-            updateStatus("متبادل وائس شناخت", "Google وائس ونڈو میں حکم بولیں", COLOR_ACCENT);
+            updateStatus("Google وائس", "مکمل کمانڈ بولیں", COLOR_ACCENT);
             startActivityForResult(intent, REQUEST_SYSTEM_SPEECH);
         } catch (ActivityNotFoundException | SecurityException error) {
-            awaitingSystemSpeech = false;
-            voiceController.onSystemLaunchFailed();
-        } catch (RuntimeException error) {
-            awaitingSystemSpeech = false;
-            Log.w(TAG, "System speech launch failed", error);
             voiceController.onSystemLaunchFailed();
         }
+    }
+
+    private void toggleHandsFree() {
+        if (HandsFreeVoiceService.isEnabled(this)) {
+            stopHandsFreeService();
+        } else {
+            requestHandsFreePermissions();
+        }
+    }
+
+    private void requestHandsFreePermissions() {
+        List<String> missing = new ArrayList<>();
+        addIfMissing(missing, Manifest.permission.RECORD_AUDIO);
+        addIfMissing(missing, Manifest.permission.READ_CONTACTS);
+        addIfMissing(missing, Manifest.permission.CALL_PHONE);
+        addIfMissing(missing, Manifest.permission.CAMERA);
+        if (Build.VERSION.SDK_INT >= 33) addIfMissing(missing, Manifest.permission.POST_NOTIFICATIONS);
+        if (missing.isEmpty()) {
+            startHandsFreeService();
+            return;
+        }
+        pendingPermission = PendingPermission.HANDS_FREE;
+        requestPermissions(missing.toArray(new String[0]), REQUEST_HANDS_FREE);
+    }
+
+    private void addIfMissing(List<String> permissions, String permission) {
+        if (checkSelfPermission(permission) != PackageManager.PERMISSION_GRANTED) {
+            permissions.add(permission);
+        }
+    }
+
+    private void startHandsFreeService() {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED) {
+            updateStatus("مائیکروفون اجازت درکار ہے", "ہینڈز فری شروع نہیں ہوا", COLOR_WARNING);
+            return;
+        }
+        voiceController.cancel("");
+        Intent intent = new Intent(this, HandsFreeVoiceService.class)
+                .setAction(HandsFreeVoiceService.ACTION_START);
+        try {
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(intent);
+            else startService(intent);
+            updateStatus("ہینڈز فری شروع ہو رہا ہے",
+                    "اب بٹن کے بغیر کمانڈ بولیں", COLOR_ACCENT);
+            mainHandler.postDelayed(this::updateHandsFreeUi, 400L);
+        } catch (RuntimeException error) {
+            Log.w(TAG, "Hands-free service failed", error);
+            updateStatus("ہینڈز فری شروع نہیں ہوا",
+                    "ایپ سامنے رکھ کر دوبارہ کوشش کریں", COLOR_WARNING);
+        }
+    }
+
+    private void stopHandsFreeService() {
+        Intent intent = new Intent(this, HandsFreeVoiceService.class)
+                .setAction(HandsFreeVoiceService.ACTION_STOP);
+        try {
+            startService(intent);
+        } catch (RuntimeException error) {
+            stopService(new Intent(this, HandsFreeVoiceService.class));
+        }
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putBoolean("hands_free_enabled", false).apply();
+        updateHandsFreeUi();
+        updateStatus("ہینڈز فری بند", "وائس بٹن دوبارہ دستیاب ہے", COLOR_WARNING);
+    }
+
+    private void updateHandsFreeUi() {
+        if (handsFreeButton == null || micButton == null) return;
+        boolean enabled = HandsFreeVoiceService.isEnabled(this);
+        handsFreeButton.setText(enabled
+                ? "🟢 ہینڈز فری چل رہا ہے — بند کریں"
+                : "🎧 ہینڈز فری آن کریں — بٹن کے بغیر وائس");
+        handsFreeButton.setTextColor(enabled ? COLOR_SUCCESS : Color.WHITE);
+        micButton.setText(enabled ? "🎧  چنٹو مسلسل سن رہا ہے" : "🎙️  حکم بولیں");
+        stopButton.setVisibility(enabled ? View.GONE : stopButton.getVisibility());
+        fallbackVoiceButton.setEnabled(!enabled);
     }
 
     private void executeCommand(String rawCommand) {
         String raw = rawCommand == null ? "" : rawCommand.trim();
         if (raw.isEmpty()) return;
-        try {
-            CommandEngine.ParsedCommand command = CommandEngine.parse(raw);
-            addHistory(raw);
-            updateStatus("کمانڈ موصول ہوئی", raw, COLOR_SUCCESS);
+        CommandEngine.ParsedCommand command = CommandEngine.parse(raw);
+        addHistory(raw);
+        updateStatus("کمانڈ موصول ہوئی", raw, COLOR_SUCCESS);
 
-            switch (command.type) {
-                case BLOCKED_FINANCIAL:
-                    speak("مالی لین دین، پاس ورڈ اور حساس اکاؤنٹ تبدیلیاں محفوظ طریقے سے بند ہیں");
-                    break;
-                case HELP:
-                    showHelp();
-                    break;
-                case TIME:
-                    speak("اس وقت " + new SimpleDateFormat("hh:mm a", Locale.getDefault())
-                            .format(new Date()) + " ہوئے ہیں");
-                    break;
-                case DATE:
-                    speak("آج " + new SimpleDateFormat(
-                            "EEEE، d MMMM yyyy", new Locale("ur", "PK")).format(new Date()) + " ہے");
-                    break;
-                case TORCH_ON:
-                case TORCH_OFF:
-                    handleTorchCommand(raw, command.type == CommandEngine.Type.TORCH_ON);
-                    break;
-                case ALARM:
-                    setAlarm(raw);
-                    break;
-                case TIMER:
-                    setTimer(raw);
-                    break;
-                case CONTACT_LOOKUP:
-                    runContactCommand(raw, command.argument, ContactAction.SHOW);
-                    break;
-                case CALL:
-                    if (isPhoneNumber(command.argument)) openDialer(command.argument);
-                    else runContactCommand(raw, command.argument, ContactAction.DIAL);
-                    break;
-                case SMS:
-                    if (isPhoneNumber(command.argument)) openMessage(command.argument);
-                    else runContactCommand(raw, command.argument, ContactAction.MESSAGE);
-                    break;
-                case COPY:
-                    if (command.argument.isEmpty()) speak("کاپی کرنے کے لیے متن بھی بولیں");
-                    else {
-                        copyToClipboard("Chintu", command.argument);
-                        speak("متن کاپی ہو گیا");
-                    }
-                    break;
-                case SHARE:
-                    if (command.argument.isEmpty()) speak("شیئر کرنے کے لیے متن بھی بولیں");
-                    else shareText(command.argument);
-                    break;
-                case YOUTUBE_SEARCH:
-                    if (command.argument.isEmpty()) openRequestedApp("یوٹیوب");
-                    else {
-                        speak("یوٹیوب پر تلاش کر رہا ہوں");
-                        openUrl("https://www.youtube.com/results?search_query="
-                                + Uri.encode(command.argument));
-                    }
-                    break;
-                case WEATHER:
-                    String weatherQuery = command.argument.isEmpty()
-                            ? "حسن ابدال موسم آج" : command.argument + " موسم";
-                    speak("موسم تلاش کر رہا ہوں");
-                    openGoogleSearch(weatherQuery);
-                    break;
-                case GOOGLE_SEARCH:
-                    openGoogleSearch(command.argument.isEmpty() ? raw : command.argument);
-                    break;
-                case MAP_SEARCH:
-                    if (command.argument.isEmpty()) openRequestedApp("گوگل میپس");
-                    else openMapSearch(command.argument);
-                    break;
-                case OPEN_CONTACTS:
-                    safeStart(new Intent(Intent.ACTION_VIEW, ContactsContract.Contacts.CONTENT_URI),
-                            "کانٹیکٹس ایپ دستیاب نہیں");
-                    break;
-                case OPEN_DIALER:
-                    safeStart(new Intent(Intent.ACTION_DIAL, Uri.parse("tel:")),
-                            "ڈائلر دستیاب نہیں");
-                    break;
-                case OPEN_MESSAGES:
-                    safeStart(Intent.makeMainSelectorActivity(
-                                    Intent.ACTION_MAIN, Intent.CATEGORY_APP_MESSAGING),
-                            "میسجز ایپ دستیاب نہیں");
-                    break;
-                case OPEN_GMAIL:
-                    openRequestedApp("جی میل");
-                    break;
-                case OPEN_CALCULATOR:
-                    if (!openRequestedApp("کیلکولیٹر")) {
-                        safeStart(Intent.makeMainSelectorActivity(
-                                        Intent.ACTION_MAIN, Intent.CATEGORY_APP_CALCULATOR),
-                                "کیلکولیٹر دستیاب نہیں");
-                    }
-                    break;
-                case OPEN_CAMERA:
-                    openCamera();
-                    break;
-                case OPEN_GALLERY:
-                    if (!openRequestedApp("گیلری")) {
-                        safeStart(new Intent(Intent.ACTION_VIEW,
-                                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI),
-                                "گیلری دستیاب نہیں");
-                    }
-                    break;
-                case OPEN_WIFI:
-                    safeStart(new Intent(Settings.ACTION_WIFI_SETTINGS),
-                            "وائی فائی سیٹنگز دستیاب نہیں");
-                    break;
-                case OPEN_BLUETOOTH:
-                    safeStart(new Intent(Settings.ACTION_BLUETOOTH_SETTINGS),
-                            "بلوٹوتھ سیٹنگز دستیاب نہیں");
-                    break;
-                case OPEN_SETTINGS:
-                    safeStart(new Intent(Settings.ACTION_SETTINGS),
-                            "سیٹنگز دستیاب نہیں");
-                    break;
-                case OPEN_PLAY_STORE:
-                    openRequestedApp("پلے اسٹور");
-                    break;
-                case OPEN_APP:
-                    if (!openRequestedApp(command.argument)) showAppNotFound(command.argument);
-                    break;
-                case UNKNOWN:
-                default:
-                    speak("یہ کمانڈ گوگل پر تلاش کر رہا ہوں");
-                    openGoogleSearch(raw);
-                    break;
-            }
-        } catch (RuntimeException error) {
-            Log.e(TAG, "Command execution failed", error);
-            updateStatus("کمانڈ مکمل نہیں ہوئی",
-                    "ایپ محفوظ حالت میں واپس آ گئی، دوبارہ کوشش کریں", COLOR_WARNING);
-            Toast.makeText(this, "کمانڈ مکمل نہیں ہوئی", Toast.LENGTH_LONG).show();
+        switch (command.type) {
+            case HANDS_FREE_ON:
+                requestHandsFreePermissions();
+                return;
+            case HANDS_FREE_OFF:
+                stopHandsFreeService();
+                return;
+            case HELP:
+                showHelp();
+                return;
+            case BLOCKED_FINANCIAL:
+                speak("مالی لین دین، پاس ورڈ اور حساس اکاؤنٹ تبدیلیاں بند ہیں");
+                return;
+            case CONTACT_LOOKUP:
+                runContactCommand(raw, command.argument, ContactAction.SHOW);
+                return;
+            case CALL:
+                if (!ensureCallPermission(raw)) return;
+                if (isPhoneNumber(command.argument)) placeCall(command.argument);
+                else runContactCommand(raw, command.argument, ContactAction.CALL);
+                return;
+            case SMS:
+                if (isPhoneNumber(command.argument)) openMessage(command.argument);
+                else runContactCommand(raw, command.argument, ContactAction.MESSAGE);
+                return;
+            case TORCH_ON:
+            case TORCH_OFF:
+                if (checkSelfPermission(Manifest.permission.CAMERA)
+                        != PackageManager.PERMISSION_GRANTED) {
+                    pendingPermission = PendingPermission.TORCH_COMMAND;
+                    pendingCommand = raw;
+                    requestPermission(Manifest.permission.CAMERA, REQUEST_CAMERA,
+                            "ٹارچ کے لیے کیمرہ کی اجازت درکار ہے");
+                    return;
+                }
+                break;
+            case GLOBAL_HOME:
+            case GLOBAL_BACK:
+            case GLOBAL_RECENTS:
+            case GLOBAL_NOTIFICATIONS:
+            case GLOBAL_QUICK_SETTINGS:
+            case GLOBAL_LOCK:
+            case GLOBAL_SCREENSHOT:
+                if (!ChintuAccessibilityService.isConnected()) {
+                    promptAccessibility();
+                    return;
+                }
+                break;
+            default:
+                break;
         }
+
+        worker.execute(() -> {
+            BackgroundCommandExecutor.Result result =
+                    BackgroundCommandExecutor.execute(getApplicationContext(), raw);
+            mainHandler.post(() -> {
+                if (destroyed) return;
+                if (result.message.isEmpty()) return;
+                if (result.handled) speak(result.message);
+                else updateStatus("کمانڈ مکمل نہیں ہوئی", result.message, COLOR_WARNING);
+            });
+        });
     }
 
-    private void showHelp() {
-        new AlertDialog.Builder(this)
-                .setTitle("چنٹو کی کمانڈز")
-                .setMessage(
-                        "• Redmi/HyperOS وائس شناخت اور متبادل Google وائس\n" +
-                        "• گوگل، یوٹیوب، موسم اور میپس سرچ\n" +
-                        "• نام سے نمبر، کال اور میسج\n" +
-                        "• انسٹال شدہ ایپس نام سے کھولنا\n" +
-                        "• الارم، ٹائمر، وقت اور تاریخ\n" +
-                        "• ٹارچ، کیمرہ، گیلری اور سیٹنگز\n" +
-                        "• متن کاپی یا شیئر کرنا\n\n" +
-                        "بینک، رقم ٹرانسفر، پاس ورڈ اور حساس اکاؤنٹ تبدیلیاں بند ہیں۔")
-                .setPositiveButton("ٹھیک ہے", null)
-                .show();
+    private boolean ensureCallPermission(String raw) {
+        if (checkSelfPermission(Manifest.permission.CALL_PHONE)
+                == PackageManager.PERMISSION_GRANTED) return true;
+        pendingPermission = PendingPermission.CALL_COMMAND;
+        pendingCommand = raw;
+        requestPermission(Manifest.permission.CALL_PHONE, REQUEST_CALL_PHONE,
+                "براہ راست کال ملانے کے لیے فون کی اجازت درکار ہے");
+        return false;
     }
 
     private void runContactCommand(String raw, String requestedName, ContactAction action) {
@@ -609,12 +703,12 @@ public final class ChintuActivity extends Activity
         }
         final int requestId = ++contactGeneration;
         updateStatus("فون ڈائریکٹری دیکھ رہا ہوں", name, COLOR_ACCENT);
-        contactExecutor.execute(() -> {
+        worker.execute(() -> {
             ContactLookupResult result = findContacts(name);
             mainHandler.post(() -> {
                 if (destroyed || isFinishing() || requestId != contactGeneration) return;
                 if (result.error != null) {
-                    speak(result.error);
+                    updateStatus("فون ڈائریکٹری مسئلہ", result.error, COLOR_WARNING);
                     return;
                 }
                 if (result.matches.isEmpty()) {
@@ -637,13 +731,10 @@ public final class ChintuActivity extends Activity
         Map<String, ContactMatch> bestByNumber = new LinkedHashMap<>();
         try (Cursor cursor = getContentResolver().query(
                 ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
-                projection,
-                null,
-                null,
+                projection, null, null,
                 ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " ASC")) {
             if (cursor == null) return new ContactLookupResult(Collections.emptyList(),
                     "فون ڈائریکٹری دستیاب نہیں");
-
             int nameIndex = cursor.getColumnIndex(
                     ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME);
             int numberIndex = cursor.getColumnIndex(
@@ -654,7 +745,7 @@ public final class ChintuActivity extends Activity
                     ContactsContract.CommonDataKinds.Phone.TYPE);
             int labelIndex = cursor.getColumnIndex(
                     ContactsContract.CommonDataKinds.Phone.LABEL);
-
+            int minimum = ContactMatcher.minimumAcceptedScore(requestedName);
             while (cursor.moveToNext()) {
                 String displayName = safeCursorString(cursor, nameIndex);
                 String number = safeCursorString(cursor, numberIndex);
@@ -665,7 +756,9 @@ public final class ChintuActivity extends Activity
                 String typeLabel = ContactsContract.CommonDataKinds.Phone.getTypeLabel(
                         getResources(), type, customLabel).toString();
                 int score = ContactMatcher.score(requestedName, displayName, typeLabel);
-                if (score < 58) continue;
+                if (score < minimum) continue;
+                if (ContactMatcher.isExactName(requestedName, displayName)) score += 30;
+                if (type == ContactsContract.CommonDataKinds.Phone.TYPE_MOBILE) score += 3;
                 String key = ContactMatcher.phoneKey(normalizedNumber, number);
                 if (key.isEmpty()) key = displayName + "|" + number;
                 ContactMatch current = bestByNumber.get(key);
@@ -688,28 +781,29 @@ public final class ChintuActivity extends Activity
     }
 
     private void presentContactMatches(List<ContactMatch> matches, ContactAction action) {
-        if (matches.size() > 1 && matches.get(0).score - matches.get(1).score < 9) {
-            int count = Math.min(matches.size(), 6);
-            String[] labels = new String[count];
-            for (int i = 0; i < count; i++) {
-                ContactMatch match = matches.get(i);
-                labels[i] = match.displayName + "  (" + match.typeLabel + ")\n" + match.phoneNumber;
-            }
-            new AlertDialog.Builder(this)
-                    .setTitle("صحیح کانٹیکٹ منتخب کریں")
-                    .setItems(labels, (dialog, which) ->
-                            runContactAction(matches.get(which), action))
-                    .setNegativeButton("منسوخ", null)
-                    .show();
-        } else {
+        boolean ambiguous = matches.size() > 1
+                && matches.get(0).score - matches.get(1).score < 7;
+        if (!ambiguous) {
             runContactAction(matches.get(0), action);
+            return;
         }
+        int count = Math.min(matches.size(), 6);
+        String[] labels = new String[count];
+        for (int i = 0; i < count; i++) {
+            ContactMatch match = matches.get(i);
+            labels[i] = match.displayName + "  (" + match.typeLabel + ")\n" + match.phoneNumber;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("صحیح کانٹیکٹ منتخب کریں")
+                .setItems(labels, (dialog, which) -> runContactAction(matches.get(which), action))
+                .setNegativeButton("منسوخ", null)
+                .show();
     }
 
     private void runContactAction(ContactMatch match, ContactAction action) {
         switch (action) {
-            case DIAL:
-                openDialer(match.phoneNumber);
+            case CALL:
+                placeCall(match.phoneNumber);
                 break;
             case MESSAGE:
                 openMessage(match.phoneNumber);
@@ -717,12 +811,37 @@ public final class ChintuActivity extends Activity
             case SHOW:
             default:
                 copyToClipboard(match.displayName, match.phoneNumber);
-                updateStatus("نمبر مل گیا",
-                        match.displayName + "\n" + match.phoneNumber + "\nنمبر کاپی ہو گیا",
-                        COLOR_SUCCESS);
-                speak(match.displayName + " کا نمبر مل گیا اور کاپی ہو گیا");
+                speak(match.displayName + " کا نمبر " + match.phoneNumber + " ہے اور کاپی ہو گیا ہے");
                 break;
         }
+    }
+
+    private void placeCall(String number) {
+        if (checkSelfPermission(Manifest.permission.CALL_PHONE)
+                != PackageManager.PERMISSION_GRANTED) {
+            updateStatus("فون اجازت درکار ہے", "براہ راست کال نہیں مل سکتی", COLOR_WARNING);
+            return;
+        }
+        try {
+            speak("کال ملا رہا ہوں");
+            startActivity(new Intent(Intent.ACTION_CALL,
+                    Uri.fromParts("tel", number, null)));
+        } catch (SecurityException | ActivityNotFoundException error) {
+            updateStatus("کال نہیں ملی", "ڈائلر یا فون اجازت دستیاب نہیں", COLOR_WARNING);
+        }
+    }
+
+    private void openMessage(String number) {
+        try {
+            startActivity(new Intent(Intent.ACTION_SENDTO,
+                    Uri.fromParts("smsto", number, null)));
+        } catch (ActivityNotFoundException error) {
+            updateStatus("میسج ایپ نہیں ملی", "", COLOR_WARNING);
+        }
+    }
+
+    private boolean isPhoneNumber(String value) {
+        return value != null && value.matches("\\+?[0-9]{7,20}");
     }
 
     private String safeCursorString(Cursor cursor, int index) {
@@ -731,269 +850,64 @@ public final class ChintuActivity extends Activity
         return value == null ? "" : value.trim();
     }
 
-    private boolean openRequestedApp(String requestedName) {
-        String requested = requestedName == null ? "" : requestedName.trim();
-        if (requested.isEmpty()) return false;
-
-        AppCatalog.AppMatch known = AppCatalog.findBest(requested);
-        if (known != null && known.score >= 82) {
-            for (String packageName : known.app.packageNames) {
-                if (launchPackage(packageName, known.app.displayName)) return true;
-            }
-        }
-
-        List<LauncherCandidate> candidates = launcherCandidates(requested);
-        if (!candidates.isEmpty()) {
-            LauncherCandidate best = candidates.get(0);
-            int secondScore = candidates.size() > 1 ? candidates.get(1).score : 0;
-            if (best.score >= 88 && best.score - secondScore >= 8) {
-                return launchCandidate(best);
-            }
-            if (best.score >= 64) {
-                showAppPicker(candidates);
-                return true;
-            }
-        }
-
-        if (known != null && known.score >= 76 && known.app.fallbackUrl != null) {
-            speak(known.app.displayName + " ایپ نہیں ملی، ویب صفحہ کھول رہا ہوں");
-            return openUrl(known.app.fallbackUrl);
-        }
-        return false;
-    }
-
-    private boolean launchPackage(String packageName, String spokenName) {
-        PackageManager manager = getPackageManager();
-        Intent launch = manager.getLaunchIntentForPackage(packageName);
-        if (launch != null) {
-            launch.addFlags(Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
-            speak(spokenName + " کھول رہا ہوں");
-            return safeStart(launch, spokenName + " نہیں کھلی");
-        }
-
-        Intent query = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER);
-        for (ResolveInfo info : manager.queryIntentActivities(query, 0)) {
-            if (info.activityInfo == null
-                    || !packageName.equals(info.activityInfo.packageName)) continue;
-            Intent explicit = new Intent(Intent.ACTION_MAIN)
-                    .addCategory(Intent.CATEGORY_LAUNCHER)
-                    .setComponent(new ComponentName(
-                            info.activityInfo.packageName, info.activityInfo.name))
-                    .addFlags(Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
-            speak(spokenName + " کھول رہا ہوں");
-            return safeStart(explicit, spokenName + " نہیں کھلی");
-        }
-        return false;
-    }
-
-    private List<LauncherCandidate> launcherCandidates(String requestedName) {
-        ArrayList<LauncherCandidate> candidates = new ArrayList<>();
-        Intent query = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER);
-        for (ResolveInfo info : getPackageManager().queryIntentActivities(query, 0)) {
-            if (info.activityInfo == null
-                    || getPackageName().equals(info.activityInfo.packageName)) continue;
-            CharSequence labelSequence = info.loadLabel(getPackageManager());
-            if (labelSequence == null) continue;
-            String label = labelSequence.toString().trim();
-            int score = AppCatalog.scoreName(requestedName, label);
-            if (score >= 52) {
-                candidates.add(new LauncherCandidate(label,
-                        info.activityInfo.packageName, info.activityInfo.name, score));
-            }
-        }
-        candidates.sort((first, second) -> Integer.compare(second.score, first.score));
-        return candidates;
-    }
-
-    private void showAppPicker(List<LauncherCandidate> candidates) {
-        int count = Math.min(candidates.size(), 6);
-        String[] labels = new String[count];
-        for (int i = 0; i < count; i++) labels[i] = candidates.get(i).label;
+    private void promptAccessibility() {
         new AlertDialog.Builder(this)
-                .setTitle("ایپ منتخب کریں")
-                .setItems(labels, (dialog, which) -> launchCandidate(candidates.get(which)))
+                .setTitle("پورا فون کنٹرول")
+                .setMessage("ہوم، واپس، حالیہ ایپس، نوٹیفکیشن، لاک اور اسکرین شاٹ کے لیے Chintu AI Accessibility سروس آن کریں۔ چنٹو اسکرین کا متن نہیں پڑھتا؛ صرف آپ کی واضح کمانڈ پر global action چلاتا ہے۔")
+                .setPositiveButton("Accessibility کھولیں", (dialog, which) -> openAccessibilitySettings())
                 .setNegativeButton("منسوخ", null)
                 .show();
     }
 
-    private boolean launchCandidate(LauncherCandidate candidate) {
-        Intent intent = new Intent(Intent.ACTION_MAIN)
-                .addCategory(Intent.CATEGORY_LAUNCHER)
-                .setComponent(new ComponentName(candidate.packageName, candidate.className))
-                .addFlags(Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
-        speak(candidate.label + " کھول رہا ہوں");
-        return safeStart(intent, candidate.label + " نہیں کھلی");
+    private void openAccessibilitySettings() {
+        try {
+            startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
+        } catch (ActivityNotFoundException error) {
+            startActivity(new Intent(Settings.ACTION_SETTINGS));
+        }
     }
 
-    private void showAppNotFound(String requestedName) {
-        String name = requestedName == null || requestedName.trim().isEmpty()
-                ? "یہ ایپ" : requestedName.trim();
+    private void openBatterySettings() {
+        try {
+            startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+        } catch (ActivityNotFoundException error) {
+            Intent details = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.fromParts("package", getPackageName(), null));
+            startActivity(details);
+        }
+    }
+
+    private void updateAccessibilityUi() {
+        if (accessibilityButton == null) return;
+        boolean connected = ChintuAccessibilityService.isConnected();
+        accessibilityButton.setText(connected
+                ? "🟢 پورا فون کنٹرول آن ہے"
+                : "⚙️ پورا فون کنٹرول آن کریں");
+        accessibilityButton.setTextColor(connected ? COLOR_SUCCESS : COLOR_MUTED);
+    }
+
+    private void showHelp() {
         new AlertDialog.Builder(this)
-                .setTitle("ایپ نہیں ملی")
-                .setMessage(name + " فون میں نہیں ملی۔")
-                .setPositiveButton("پلے اسٹور میں تلاش", (dialog, which) -> {
-                    String market = "market://search?q=" + Uri.encode(name);
-                    String web = "https://play.google.com/store/search?q="
-                            + Uri.encode(name) + "&c=apps";
-                    if (!safeStart(new Intent(Intent.ACTION_VIEW, Uri.parse(market)), "")) {
-                        openUrl(web);
-                    }
-                })
-                .setNegativeButton("منسوخ", null)
+                .setTitle("چنٹو کی مکمل کمانڈز")
+                .setMessage(
+                        "ہینڈز فری:\n" +
+                        "• ہینڈز فری آن کرو / بند کرو\n" +
+                        "• دوسری ایپ میں: چنٹو، ہوم کو کال کرو\n\n" +
+                        "فون کنٹرول:\n" +
+                        "• ہوم اسکرین، واپس، حالیہ ایپس\n" +
+                        "• نوٹیفکیشن، کوئیک سیٹنگز، فون لاک، اسکرین شاٹ\n" +
+                        "• آواز تیز/کم/بند/فل، پلے، پاز، اگلا یا پچھلا گانا\n" +
+                        "• روشنی تیز/کم/فل\n\n" +
+                        "روزمرہ کام:\n" +
+                        "• نام سے براہ راست کال، نمبر نکالنا یا میسج\n" +
+                        "• کوئی بھی انسٹال شدہ ایپ کھولنا\n" +
+                        "• گوگل، یوٹیوب، موسم اور میپس سرچ\n" +
+                        "• الارم، ٹائمر، وقت، تاریخ، ٹارچ، کیمرہ، گیلری\n" +
+                        "• وائی فائی، بلوٹوتھ، موبائل ڈیٹا، کیلنڈر، فائلز اور سیٹنگز\n" +
+                        "• متن کاپی یا شیئر کرنا\n\n" +
+                        "بینک، رقم ٹرانسفر، پاس ورڈ اور حساس اکاؤنٹ تبدیلیاں بند ہیں۔")
+                .setPositiveButton("ٹھیک ہے", null)
                 .show();
-    }
-
-    private void openCamera() {
-        Intent primary = new Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA);
-        Intent fallback = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
-        if (!safeStart(primary, "")) safeStart(fallback, "کیمرہ دستیاب نہیں");
-    }
-
-    private void openMapSearch(String query) {
-        speak("میپس میں تلاش کر رہا ہوں");
-        Intent geo = new Intent(Intent.ACTION_VIEW,
-                Uri.parse("geo:0,0?q=" + Uri.encode(query)));
-        Intent web = new Intent(Intent.ACTION_VIEW,
-                Uri.parse("https://www.google.com/maps/search/?api=1&query=" + Uri.encode(query)));
-        if (!safeStart(geo, "")) safeStart(web, "میپس دستیاب نہیں");
-    }
-
-    private void openGoogleSearch(String query) {
-        String cleaned = query == null ? "" : query.trim();
-        if (cleaned.isEmpty()) {
-            speak("تلاش کے لیے الفاظ واضح بولیں");
-            return;
-        }
-        speak("گوگل پر تلاش کر رہا ہوں");
-        openUrl("https://www.google.com/search?q=" + Uri.encode(cleaned));
-    }
-
-    private boolean openUrl(String url) {
-        return safeStart(new Intent(Intent.ACTION_VIEW, Uri.parse(url)),
-                "براؤزر دستیاب نہیں");
-    }
-
-    private void openDialer(String number) {
-        speak("نمبر ڈائلر میں کھول رہا ہوں");
-        safeStart(new Intent(Intent.ACTION_DIAL,
-                Uri.fromParts("tel", number, null)), "ڈائلر دستیاب نہیں");
-    }
-
-    private void openMessage(String number) {
-        speak("میسج لکھنے کا صفحہ کھول رہا ہوں");
-        safeStart(new Intent(Intent.ACTION_SENDTO,
-                Uri.fromParts("smsto", number, null)), "میسج ایپ دستیاب نہیں");
-    }
-
-    private boolean isPhoneNumber(String value) {
-        return value != null && value.matches("\\+?[0-9]{7,20}");
-    }
-
-    private void handleTorchCommand(String rawCommand, boolean turnOn) {
-        if (checkSelfPermission(Manifest.permission.CAMERA)
-                != PackageManager.PERMISSION_GRANTED) {
-            pendingPermission = PendingPermission.TORCH_COMMAND;
-            pendingCommand = rawCommand;
-            requestPermission(Manifest.permission.CAMERA, REQUEST_CAMERA,
-                    "ٹارچ چلانے کے لیے کیمرہ کی اجازت درکار ہے");
-            return;
-        }
-        setTorch(turnOn);
-    }
-
-    private void setTorch(boolean enabled) {
-        CameraManager manager = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
-        if (manager == null) {
-            speak("ٹارچ دستیاب نہیں");
-            return;
-        }
-        try {
-            String cameraId = findFlashCamera(manager);
-            if (cameraId == null) {
-                speak("اس فون میں ٹارچ دستیاب نہیں");
-                return;
-            }
-            manager.setTorchMode(cameraId, enabled);
-            speak(enabled ? "ٹارچ آن کر دی ہے" : "ٹارچ بند کر دی ہے");
-        } catch (CameraAccessException | SecurityException error) {
-            Log.w(TAG, "Torch command failed", error);
-            speak("ٹارچ چلانے میں مسئلہ آیا");
-        }
-    }
-
-    private String findFlashCamera(CameraManager manager) throws CameraAccessException {
-        for (String id : manager.getCameraIdList()) {
-            CameraCharacteristics characteristics = manager.getCameraCharacteristics(id);
-            Boolean flash = characteristics.get(CameraCharacteristics.FLASH_INFO_AVAILABLE);
-            Integer facing = characteristics.get(CameraCharacteristics.LENS_FACING);
-            if (Boolean.TRUE.equals(flash)
-                    && (facing == null || facing == CameraCharacteristics.LENS_FACING_BACK)) {
-                return id;
-            }
-        }
-        return null;
-    }
-
-    private void setAlarm(String raw) {
-        CommandEngine.ParsedTime time = CommandEngine.parseClockTime(raw);
-        Intent intent = new Intent(AlarmClock.ACTION_SET_ALARM)
-                .putExtra(AlarmClock.EXTRA_MESSAGE, "Chintu Alarm")
-                .putExtra(AlarmClock.EXTRA_SKIP_UI, false);
-        if (time != null) {
-            intent.putExtra(AlarmClock.EXTRA_HOUR, time.hour);
-            intent.putExtra(AlarmClock.EXTRA_MINUTES, time.minute);
-            speak("الارم تیار کر رہا ہوں");
-        } else {
-            speak("وقت واضح نہیں ملا، الارم ایپ کھول رہا ہوں");
-        }
-        safeStart(intent, "الارم ایپ دستیاب نہیں");
-    }
-
-    private void setTimer(String raw) {
-        int seconds = CommandEngine.parseDurationSeconds(raw);
-        Intent intent = new Intent(AlarmClock.ACTION_SET_TIMER)
-                .putExtra(AlarmClock.EXTRA_MESSAGE, "Chintu Timer")
-                .putExtra(AlarmClock.EXTRA_SKIP_UI, false);
-        if (seconds > 0) {
-            intent.putExtra(AlarmClock.EXTRA_LENGTH, seconds);
-            speak("ٹائمر تیار کر رہا ہوں");
-        } else {
-            speak("مدت واضح نہیں ملی، ٹائمر ایپ کھول رہا ہوں");
-        }
-        safeStart(intent, "ٹائمر ایپ دستیاب نہیں");
-    }
-
-    private void shareText(String text) {
-        Intent share = new Intent(Intent.ACTION_SEND)
-                .setType("text/plain")
-                .putExtra(Intent.EXTRA_TEXT, text);
-        speak("شیئر کرنے کے لیے ایپ منتخب کریں");
-        safeStart(Intent.createChooser(share, "ایپ منتخب کریں"),
-                "شیئر کرنے والی ایپ دستیاب نہیں");
-    }
-
-    private void copyToClipboard(String label, String text) {
-        ClipboardManager clipboard =
-                (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-        if (clipboard != null) {
-            clipboard.setPrimaryClip(ClipData.newPlainText(label, text));
-        }
-    }
-
-    private boolean safeStart(Intent intent, String failureMessage) {
-        try {
-            startActivity(intent);
-            return true;
-        } catch (ActivityNotFoundException | SecurityException error) {
-            Log.w(TAG, "Intent unavailable: " + intent, error);
-        } catch (RuntimeException error) {
-            Log.w(TAG, "Intent failed: " + intent, error);
-        }
-        if (failureMessage != null && !failureMessage.isEmpty()) {
-            updateStatus("یہ کام دستیاب نہیں", failureMessage, COLOR_WARNING);
-            Toast.makeText(this, failureMessage, Toast.LENGTH_LONG).show();
-        }
-        return false;
     }
 
     private void requestPermission(String permission, int requestCode, String explanation) {
@@ -1010,24 +924,23 @@ public final class ChintuActivity extends Activity
         }
     }
 
-    private void showPermissionSettings(String explanation) {
-        new AlertDialog.Builder(this)
-                .setTitle("اجازت بند ہے")
-                .setMessage(explanation + "\n\nسیٹنگز میں جا کر اجازت Allow کریں۔")
-                .setPositiveButton("ایپ سیٹنگز", (dialog, which) -> {
-                    Intent intent = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                            Uri.fromParts("package", getPackageName(), null));
-                    safeStart(intent, "ایپ سیٹنگز نہیں کھلیں");
-                })
-                .setNegativeButton("منسوخ", null)
-                .show();
-    }
-
     @Override
     public void onRequestPermissionsResult(int requestCode,
                                            String[] permissions,
                                            int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQUEST_HANDS_FREE) {
+            pendingPermission = PendingPermission.NONE;
+            if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                    == PackageManager.PERMISSION_GRANTED) {
+                startHandsFreeService();
+            } else {
+                updateStatus("مائیکروفون اجازت نہیں ملی",
+                        "ہینڈز فری شروع نہیں ہوا", COLOR_WARNING);
+            }
+            return;
+        }
+
         boolean granted = grantResults.length > 0
                 && grantResults[0] == PackageManager.PERMISSION_GRANTED;
         PendingPermission action = pendingPermission;
@@ -1036,22 +949,17 @@ public final class ChintuActivity extends Activity
         pendingCommand = null;
 
         if (!granted) {
-            String permission = permissions.length > 0 ? permissions[0] : "";
-            boolean permanentlyDenied = !permission.isEmpty()
-                    && !shouldShowRequestPermissionRationale(permission);
-            if (permanentlyDenied) {
-                showPermissionSettings("اس کام کے لیے متعلقہ اجازت ضروری ہے۔");
-            } else {
-                updateStatus("اجازت نہیں ملی",
-                        "متعلقہ کام کے لیے فون کی اجازت درکار ہے", COLOR_WARNING);
-            }
+            updateStatus("اجازت نہیں ملی",
+                    "متعلقہ کام کے لیے فون کی اجازت درکار ہے", COLOR_WARNING);
             return;
         }
-
         if (requestCode == REQUEST_MICROPHONE && action == PendingPermission.VOICE) {
             startVoiceRecognition();
         } else if (requestCode == REQUEST_CONTACTS
                 && action == PendingPermission.CONTACT_COMMAND && command != null) {
+            executeCommand(command);
+        } else if (requestCode == REQUEST_CALL_PHONE
+                && action == PendingPermission.CALL_COMMAND && command != null) {
             executeCommand(command);
         } else if (requestCode == REQUEST_CAMERA
                 && action == PendingPermission.TORCH_COMMAND && command != null) {
@@ -1063,7 +971,6 @@ public final class ChintuActivity extends Activity
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode != REQUEST_SYSTEM_SPEECH) return;
-        awaitingSystemSpeech = false;
         if (resultCode == RESULT_OK && data != null) {
             ArrayList<String> matches =
                     data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS);
@@ -1090,24 +997,19 @@ public final class ChintuActivity extends Activity
                 fallbackVoiceButton.setEnabled(false);
                 break;
             case RECOVERING:
-                micButton.setText("دوبارہ کوشش...");
+                micButton.setText("🎙️  سن رہا ہوں...");
                 stopButton.setVisibility(View.VISIBLE);
                 fallbackVoiceButton.setEnabled(false);
                 break;
-            case SYSTEM_FALLBACK:
-                micButton.setText("🎙️  حکم بولیں");
-                stopButton.setVisibility(View.GONE);
-                fallbackVoiceButton.setEnabled(true);
-                break;
             case IDLE:
+            case SYSTEM_FALLBACK:
             default:
                 resetVoiceUi();
                 break;
         }
         if (status != null && !status.isEmpty()) {
-            int color = state == VoiceRecognitionController.State.IDLE
-                    ? COLOR_WARNING : COLOR_ACCENT;
-            updateStatus(status, detail, color);
+            updateStatus(status, detail,
+                    state == VoiceRecognitionController.State.IDLE ? COLOR_WARNING : COLOR_ACCENT);
         }
     }
 
@@ -1129,7 +1031,7 @@ public final class ChintuActivity extends Activity
 
     @Override
     public void onSystemRecognizerRequested(Intent intent) {
-        launchSystemRecognizer(intent);
+        // Automatic popup fallback is deliberately disabled; user can tap Google Voice manually.
     }
 
     @Override
@@ -1140,6 +1042,10 @@ public final class ChintuActivity extends Activity
     }
 
     private void resetVoiceUi() {
+        if (HandsFreeVoiceService.isEnabled(this)) {
+            updateHandsFreeUi();
+            return;
+        }
         if (micButton != null) micButton.setText("🎙️  حکم بولیں");
         if (stopButton != null) stopButton.setVisibility(View.GONE);
         if (fallbackVoiceButton != null) fallbackVoiceButton.setEnabled(true);
@@ -1171,6 +1077,14 @@ public final class ChintuActivity extends Activity
         tts.setSpeechRate(0.92f);
         tts.setPitch(0.9f);
         ttsReady = true;
+    }
+
+    private void copyToClipboard(String label, String text) {
+        ClipboardManager clipboard =
+                (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+        if (clipboard != null) {
+            clipboard.setPrimaryClip(ClipData.newPlainText(label, text));
+        }
     }
 
     private void addHistory(String command) {
@@ -1227,6 +1141,18 @@ public final class ChintuActivity extends Activity
         if (commandInput != null) commandInput.clearFocus();
     }
 
+    private void registerHandsFreeReceiver() {
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(HandsFreeVoiceService.ACTION_STATUS);
+        filter.addAction(HandsFreeVoiceService.ACTION_COMMAND);
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(handsFreeReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            registerReceiver(handsFreeReceiver, filter);
+        }
+        receiverRegistered = true;
+    }
+
     private GradientDrawable backgroundGradient() {
         GradientDrawable drawable = new GradientDrawable(
                 GradientDrawable.Orientation.TOP_BOTTOM,
@@ -1263,11 +1189,18 @@ public final class ChintuActivity extends Activity
     @Override
     protected void onResume() {
         super.onResume();
-        if (voiceController != null) voiceController.setForeground(true);
+        appVisible = true;
+        if (voiceController != null) {
+            voiceController.setForeground(true);
+            voiceController.prepare();
+        }
+        updateHandsFreeUi();
+        updateAccessibilityUi();
     }
 
     @Override
     protected void onStop() {
+        appVisible = false;
         if (voiceController != null) voiceController.setForeground(false);
         resetVoiceUi();
         super.onStop();
@@ -1276,10 +1209,18 @@ public final class ChintuActivity extends Activity
     @Override
     protected void onDestroy() {
         destroyed = true;
+        appVisible = false;
         contactGeneration++;
-        contactExecutor.shutdownNow();
+        worker.shutdownNow();
         mainHandler.removeCallbacksAndMessages(null);
         if (voiceController != null) voiceController.release();
+        if (receiverRegistered) {
+            try {
+                unregisterReceiver(handsFreeReceiver);
+            } catch (IllegalArgumentException ignored) {
+                // Already unregistered.
+            }
+        }
         if (tts != null) {
             tts.stop();
             tts.shutdown();
@@ -1308,20 +1249,6 @@ public final class ChintuActivity extends Activity
         ContactLookupResult(List<ContactMatch> matches, String error) {
             this.matches = matches;
             this.error = error;
-        }
-    }
-
-    private static final class LauncherCandidate {
-        final String label;
-        final String packageName;
-        final String className;
-        final int score;
-
-        LauncherCandidate(String label, String packageName, String className, int score) {
-            this.label = label;
-            this.packageName = packageName;
-            this.className = className;
-            this.score = score;
         }
     }
 }

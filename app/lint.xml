@@ -4,13 +4,21 @@
     <issue id="OldTargetApi" severity="ignore" />
     <issue id="GradleDependency" severity="ignore" />
 
-    <!-- The UI is intentionally generated in Java and Urdu-first; moving these fixed labels
-         to resources would not change runtime behavior and is tracked separately from stability. -->
+    <!-- The UI is intentionally generated in Java and Urdu-first. -->
     <issue id="SetTextI18n">
         <ignore path="src/main/java/com/zeshan/chintuai/ChintuActivity.java" />
     </issue>
-    <!-- Right alignment is intentional for this Urdu-first, RTL command interface. -->
     <issue id="RtlHardcoded">
+        <ignore path="src/main/java/com/zeshan/chintuai/ChintuActivity.java" />
+    </issue>
+
+    <!-- Platform registerReceiver flags only exist on API 33; the pre-33 branch is required. -->
+    <issue id="UnspecifiedRegisterReceiverFlag">
+        <ignore path="src/main/java/com/zeshan/chintuai/ChintuActivity.java" />
+    </issue>
+
+    <!-- minSdk is 26; this explicit branch preserves readable foreground-service startup code. -->
+    <issue id="ObsoleteSdkInt">
         <ignore path="src/main/java/com/zeshan/chintuai/ChintuActivity.java" />
     </issue>
 </lint>
