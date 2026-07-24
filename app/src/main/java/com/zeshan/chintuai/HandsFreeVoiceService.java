@@ -48,6 +48,8 @@ public final class HandsFreeVoiceService extends Service
     private static final int NOTIFICATION_ID = 7101;
     private static final long START_WATCHDOG_MS = 4500L;
     private static final long SESSION_WATCHDOG_MS = 60000L;
+    private static final long WAKE_LOCK_TIMEOUT_MS = 10L * 60L * 1000L;
+    private static final long WAKE_LOCK_RENEW_MS = 9L * 60L * 1000L;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final ExecutorService commandExecutor = Executors.newSingleThreadExecutor();
@@ -62,6 +64,7 @@ public final class HandsFreeVoiceService extends Service
     private Runnable restartRunnable;
     private Runnable startWatchdog;
     private Runnable sessionWatchdog;
+    private Runnable wakeLockRenewal;
     private PowerManager.WakeLock wakeLock;
     private TextToSpeech tts;
     private boolean ttsReady;
@@ -113,7 +116,7 @@ public final class HandsFreeVoiceService extends Service
 
     private void startAsForeground() {
         Notification notification = buildNotification("چنٹو سن رہا ہے");
-        if (Build.VERSION.SDK_INT >= 29) {
+        if (Build.VERSION.SDK_INT >= 30) {
             startForeground(NOTIFICATION_ID, notification,
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE);
         } else {
@@ -131,9 +134,7 @@ public final class HandsFreeVoiceService extends Service
         PendingIntent stopPending = PendingIntent.getService(this, 2, stopIntent,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
-        Notification.Builder builder = Build.VERSION.SDK_INT >= 26
-                ? new Notification.Builder(this, CHANNEL_ID)
-                : new Notification.Builder(this);
+        Notification.Builder builder = new Notification.Builder(this, CHANNEL_ID);
         return builder
                 .setSmallIcon(android.R.drawable.ic_btn_speak_now)
                 .setContentTitle("Chintu AI — ہینڈز فری")
@@ -148,7 +149,6 @@ public final class HandsFreeVoiceService extends Service
     }
 
     private void createNotificationChannel() {
-        if (Build.VERSION.SDK_INT < 26) return;
         NotificationChannel channel = new NotificationChannel(
                 CHANNEL_ID, "Chintu hands-free microphone", NotificationManager.IMPORTANCE_LOW);
         channel.setDescription("چنٹو کی مسلسل وائس کمانڈ سروس");
@@ -450,11 +450,28 @@ public final class HandsFreeVoiceService extends Service
     }
 
     private void acquireWakeLock() {
-        if (wakeLock != null && !wakeLock.isHeld()) wakeLock.acquire();
+        if (wakeLock == null) return;
+        try {
+            if (wakeLock.isHeld()) wakeLock.release();
+            wakeLock.acquire(WAKE_LOCK_TIMEOUT_MS);
+            if (wakeLockRenewal != null) handler.removeCallbacks(wakeLockRenewal);
+            wakeLockRenewal = this::acquireWakeLock;
+            handler.postDelayed(wakeLockRenewal, WAKE_LOCK_RENEW_MS);
+        } catch (RuntimeException ignored) {
+            // Foreground service continues even if a vendor blocks the wake lock.
+        }
     }
 
     private void releaseWakeLock() {
-        if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+        if (wakeLockRenewal != null) handler.removeCallbacks(wakeLockRenewal);
+        wakeLockRenewal = null;
+        if (wakeLock != null && wakeLock.isHeld()) {
+            try {
+                wakeLock.release();
+            } catch (RuntimeException ignored) {
+                // Already released by the platform timeout.
+            }
+        }
     }
 
     private void cancelRecognizer() {
