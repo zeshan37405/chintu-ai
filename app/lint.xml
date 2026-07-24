@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<lint>
+    <!-- The UI is intentionally generated in Java and Urdu-first; moving these fixed labels
+         to resources would not change runtime behavior and is tracked separately from stability. -->
+    <issue id="SetTextI18n">
+        <ignore path="src/main/java/com/zeshan/chintuai/ChintuActivity.java" />
+    </issue>
+    <!-- Right alignment is intentional for this Urdu-first, RTL command interface. -->
+    <issue id="RtlHardcoded">
+        <ignore path="src/main/java/com/zeshan/chintuai/ChintuActivity.java" />
+    </issue>
+</lint>
