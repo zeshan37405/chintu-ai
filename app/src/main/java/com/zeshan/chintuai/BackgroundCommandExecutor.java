@@ -2,7 +2,6 @@ package com.zeshan.chintuai;
 
 import android.Manifest;
 import android.accessibilityservice.AccessibilityService;
-import android.app.NotificationManager;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.ComponentName;
@@ -285,7 +284,7 @@ public final class BackgroundCommandExecutor {
                 if (type == ContactsContract.CommonDataKinds.Phone.TYPE_MOBILE) score += 3;
                 matches.add(new ContactCandidate(name, number, score));
             }
-        } catch (SecurityException | RuntimeException ignored) {
+        } catch (RuntimeException ignored) {
             return null;
         }
         if (matches.isEmpty()) return null;
@@ -503,7 +502,8 @@ public final class BackgroundCommandExecutor {
             context.startActivity(intent);
             return Result.ok(message);
         } catch (RuntimeException error) {
-            return Result.fail(message.isEmpty() ? "یہ کام دستیاب نہیں" : message + "، مگر ایپ دستیاب نہیں");
+            return Result.fail(message.isEmpty()
+                    ? "یہ کام دستیاب نہیں" : message + "، مگر ایپ دستیاب نہیں");
         }
     }
 
