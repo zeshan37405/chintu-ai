@@ -1,5 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <lint>
+    <!-- Android 36 is the newest stable SDK installed by the release runner. -->
+    <issue id="OldTargetApi" />
+    <issue id="GradleDependency" />
+
     <!-- The UI is intentionally generated in Java and Urdu-first; moving these fixed labels
          to resources would not change runtime behavior and is tracked separately from stability. -->
     <issue id="SetTextI18n">
