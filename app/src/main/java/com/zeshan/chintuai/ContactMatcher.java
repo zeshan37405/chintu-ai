@@ -3,7 +3,7 @@ package com.zeshan.chintuai;
 import java.util.ArrayList;
 import java.util.List;
 
-/** Contact-name normalization and fuzzy scoring, isolated for regression tests. */
+/** Contact-name normalization and conservative fuzzy scoring. */
 public final class ContactMatcher {
     private ContactMatcher() {
     }
@@ -38,10 +38,26 @@ public final class ContactMatcher {
     public static int score(String requested, String displayName, String typeLabel) {
         String target = normalizeContactKey(requested);
         if (target.isEmpty()) return 0;
-        int nameScore = similarity(target, normalizeContactKey(displayName));
+        String name = normalizeContactKey(displayName);
+        int nameScore = similarity(target, name);
         int labelScore = similarity(target, normalizeContactKey(typeLabel));
-        // Phone labels such as "Home" are common and must never outrank a real name match.
-        return Math.max(nameScore, Math.min(45, labelScore));
+        // Generic labels such as Home/Mobile must never create false contact matches.
+        int score = Math.max(nameScore, Math.min(35, labelScore));
+        // Very short requests such as "Home" previously matched Hotel/Homoe. Be strict.
+        if (target.length() <= 4 && !name.equals(target)
+                && !containsWholeToken(name, target)) {
+            score = Math.min(score, 55);
+        }
+        return score;
+    }
+
+    public static int minimumAcceptedScore(String requested) {
+        String target = normalizeContactKey(requested);
+        return target.length() <= 4 ? 82 : 62;
+    }
+
+    public static boolean isExactName(String requested, String displayName) {
+        return normalizeContactKey(requested).equals(normalizeContactKey(displayName));
     }
 
     public static int similarity(String target, String candidate) {
@@ -49,7 +65,7 @@ public final class ContactMatcher {
         if (candidate.equals(target)) return 100;
         if (containsWholeToken(candidate, target)) return 96;
         if (candidate.startsWith(target + " ") || target.startsWith(candidate + " ")) return 92;
-        if (candidate.contains(target) || target.contains(candidate)) return 84;
+        if (target.length() >= 5 && (candidate.contains(target) || target.contains(candidate))) return 84;
 
         String[] targetWords = target.split(" ");
         String[] candidateWords = candidate.split(" ");
@@ -58,14 +74,14 @@ public final class ContactMatcher {
             for (String candidateWord : candidateWords) {
                 if (targetWord.equals(candidateWord)) {
                     best = Math.max(best, 90);
-                } else if (targetWord.length() >= 3 && candidateWord.startsWith(targetWord)) {
+                } else if (targetWord.length() >= 4 && candidateWord.startsWith(targetWord)) {
                     best = Math.max(best, 80);
-                } else if (candidateWord.length() >= 3 && targetWord.startsWith(candidateWord)) {
+                } else if (candidateWord.length() >= 4 && targetWord.startsWith(candidateWord)) {
                     best = Math.max(best, 76);
-                } else {
+                } else if (Math.min(targetWord.length(), candidateWord.length()) >= 5) {
                     int distance = levenshtein(targetWord, candidateWord);
                     int max = Math.max(targetWord.length(), candidateWord.length());
-                    if (max > 0) best = Math.max(best, 100 - ((distance * 100) / max));
+                    best = Math.max(best, 100 - ((distance * 100) / max));
                 }
             }
         }
