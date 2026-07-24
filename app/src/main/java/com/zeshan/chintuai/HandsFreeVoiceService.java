@@ -34,20 +34,13 @@ import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Stable hands-free recognizer for Android 13+.
- *
- * Android's ordinary SpeechRecognizer closes its microphone after a silence timeout. On Android 13
- * and newer Chintu instead owns one continuous AudioRecord stream and supplies that audio to the
- * recognition service through EXTRA_AUDIO_SOURCE in segmented-session mode. The recognition
- * session therefore remains open until Chintu closes the pipe, rather than blinking on/off every
- * one or two seconds. A conservative ordinary-session fallback remains for recognition services
- * that do not implement injected audio.
+ * Stable hands-free recognizer with Indian-Urdu command normalization and guarded speech output.
+ * Android 13+ uses one AudioRecord stream supplied to SpeechRecognizer in segmented-session mode.
  */
 public final class HandsFreeVoiceService extends Service
         implements RecognitionListener, TextToSpeech.OnInitListener {
@@ -72,13 +65,20 @@ public final class HandsFreeVoiceService extends Service
     private static final long FALLBACK_SESSION_WATCHDOG_MS = 55_000L;
     private static final long INJECTED_HEALTH_RESTART_MS = 20L * 60L * 1000L;
     private static final long COMMAND_WINDOW_MS = 12_000L;
-    private static final long IGNORE_AFTER_TTS_MS = 1_100L;
+    private static final long IGNORE_AFTER_TTS_MS = 700L;
     private static final long WAKE_LOCK_TIMEOUT_MS = 10L * 60L * 1000L;
     private static final long WAKE_LOCK_RENEW_MS = 9L * 60L * 1000L;
 
+    private static final String[] RECOGNITION_LANGUAGES = {"ur-IN", "ur-PK", "en-IN"};
     private static final List<String> WAKE_PREFIXES = Arrays.asList(
             "چنٹو", "چنتو", "چینٹو", "چین تو", "چن ٹو",
-            "جنٹو", "جن تو", "چندو", "chintu");
+            "جنٹو", "جن تو", "چندو", "chintu", "chintoo");
+
+    private enum SpeechPurpose {
+        NONE,
+        WAKE_ACKNOWLEDGEMENT,
+        COMMAND_RESPONSE
+    }
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final ExecutorService commandExecutor = Executors.newSingleThreadExecutor();
@@ -98,6 +98,7 @@ public final class HandsFreeVoiceService extends Service
     private boolean injectedAudioDisabled;
     private int injectedFailures;
     private int fallbackFailures;
+    private int languageIndex;
 
     private String lastPartial = "";
     private String lastStatus = "";
@@ -110,9 +111,13 @@ public final class HandsFreeVoiceService extends Service
     private Runnable startWatchdog;
     private Runnable sessionWatchdog;
     private Runnable wakeLockRenewal;
+    private Runnable ttsWatchdog;
     private PowerManager.WakeLock wakeLock;
     private TextToSpeech tts;
     private boolean ttsReady;
+    private SpeechPurpose speechPurpose = SpeechPurpose.NONE;
+    private String activeUtteranceId = "";
+    private int utteranceSequence;
 
     public static boolean isEnabled(Context context) {
         return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -127,7 +132,7 @@ public final class HandsFreeVoiceService extends Service
         PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
         if (power != null) {
             wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,
-                    "ChintuAI:StableHandsFree");
+                    "ChintuAI:VoiceSocialControls");
             wakeLock.setReferenceCounted(false);
         }
     }
@@ -153,6 +158,7 @@ public final class HandsFreeVoiceService extends Service
         injectedFailures = 0;
         fallbackFailures = 0;
         injectedAudioDisabled = false;
+        languageIndex = 0;
         setEnabled(true);
         startAsForeground();
         acquireWakeLock();
@@ -228,7 +234,6 @@ public final class HandsFreeVoiceService extends Service
         boolean started = injectedAttempted && startInjectedSegmentedSession();
 
         if (!started) {
-            // If an injected session partially started, recreate the recognizer before the fallback.
             if (injectedAttempted) {
                 stopRecognitionSession(true);
                 if (!createRecognizer()) {
@@ -265,8 +270,6 @@ public final class HandsFreeVoiceService extends Service
     private boolean createRecognizer() {
         if (!SpeechRecognizer.isRecognitionAvailable(this)) return false;
         try {
-            // The installed Google/Xiaomi recognizer is preferred because Urdu support is more
-            // reliable than merely checking whether any on-device recognizer exists.
             recognizer = SpeechRecognizer.createSpeechRecognizer(this);
             return recognizer != null;
         } catch (RuntimeException error) {
@@ -346,7 +349,7 @@ public final class HandsFreeVoiceService extends Service
                 }
             }
         } catch (IOException | RuntimeException ignored) {
-            // Closing the pipe during command execution is the normal session shutdown path.
+            // Closing the pipe during command execution is the normal shutdown path.
         } finally {
             pumpingAudio.set(false);
         }
@@ -356,17 +359,23 @@ public final class HandsFreeVoiceService extends Service
         Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
         intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,
                 RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
-        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ur-PK");
-        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "ur-PK");
-        intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 10);
+        String language = RECOGNITION_LANGUAGES[Math.min(
+                languageIndex, RECOGNITION_LANGUAGES.length - 1)];
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, language);
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, language);
+        intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 15);
         intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
         intent.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false);
 
         if (Build.VERSION.SDK_INT >= 33) {
+            intent.putExtra(RecognizerIntent.EXTRA_ENABLE_BIASING_DEVICE_CONTEXT, true);
             ArrayList<String> bias = new ArrayList<>(Arrays.asList(
-                    "چنٹو", "چنٹو ذیشان", "ہوم کو کال کرو", "واٹس ایپ کھولو",
-                    "نیچے سکرول کرو", "اوپر سکرول کرو", "واپس جاؤ",
-                    "اسکرین شاٹ لو", "تصدیق کرو"));
+                    "چنٹو", "چنٹو ذیشان", "واٹس ایپ", "واٹسپ", "وٹس ایپ",
+                    "فیس بک", "انسٹاگرام", "یوٹیوب", "ٹیلیگرام", "ٹک ٹاک",
+                    "واٹس ایپ کھولو", "فیس بک کھولو", "نیچے سکرول کرو",
+                    "اوپر سکرول کرو", "پوسٹ لکھو", "ٹائپ کرو", "کلک کرو",
+                    "ہوم کو کال کرو", "واپس جاؤ", "اسکرین شاٹ لو", "تصدیق کرو",
+                    "व्हाट्सएप", "फेसबुक", "इंस्टाग्राम", "नीचे स्क्रॉल करो"));
             intent.putStringArrayListExtra(RecognizerIntent.EXTRA_BIASING_STRINGS, bias);
             if (!injected) {
                 intent.putExtra(
@@ -375,13 +384,25 @@ public final class HandsFreeVoiceService extends Service
             }
         }
 
+        if (Build.VERSION.SDK_INT >= 34) {
+            ArrayList<String> allowed = new ArrayList<>(Arrays.asList(
+                    "ur-IN", "ur-PK", "en-IN", "en-US", "hi-IN"));
+            intent.putExtra(RecognizerIntent.EXTRA_ENABLE_LANGUAGE_DETECTION, true);
+            intent.putStringArrayListExtra(
+                    RecognizerIntent.EXTRA_LANGUAGE_DETECTION_ALLOWED_LANGUAGES, allowed);
+            intent.putExtra(RecognizerIntent.EXTRA_ENABLE_LANGUAGE_SWITCH,
+                    RecognizerIntent.LANGUAGE_SWITCH_BALANCED);
+            intent.putStringArrayListExtra(
+                    RecognizerIntent.EXTRA_LANGUAGE_SWITCH_ALLOWED_LANGUAGES, allowed);
+        }
+
         if (!injected) {
             intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 45_000L);
             intent.putExtra(
-                    RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2_200L);
+                    RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2_500L);
             intent.putExtra(
                     RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS,
-                    3_500L);
+                    4_000L);
         }
         return intent;
     }
@@ -488,6 +509,14 @@ public final class HandsFreeVoiceService extends Service
             stopHandsFree("");
             return;
         }
+        if (error == SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED
+                || error == SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE) {
+            if (languageIndex < RECOGNITION_LANGUAGES.length - 1) languageIndex++;
+            broadcastStatus("وائس زبان بدل رہا ہوں",
+                    "Indian Urdu سے متبادل Urdu/English ماڈل آزما رہا ہوں", false);
+            scheduleRestart(450L, false);
+            return;
+        }
 
         if (wasInjected) {
             injectedFailures++;
@@ -499,8 +528,10 @@ public final class HandsFreeVoiceService extends Service
         } else {
             fallbackFailures++;
         }
-        scheduleRestart(wasInjected && !injectedAudioDisabled
-                ? 250L : nextFallbackDelay(), false);
+        long delay = error == SpeechRecognizer.ERROR_TOO_MANY_REQUESTS
+                ? 3_000L
+                : wasInjected && !injectedAudioDisabled ? 250L : nextFallbackDelay();
+        scheduleRestart(delay, false);
     }
 
     @Override
@@ -525,7 +556,8 @@ public final class HandsFreeVoiceService extends Service
         if (candidate.text.isEmpty()) return;
         lastPartial = candidate.text;
         if (hasFlexibleWakeWord(candidate.text) || commandWindowOpen()) {
-            broadcastStatus("سن رہا ہوں", candidate.text, false);
+            broadcastStatus("سن رہا ہوں",
+                    AccentCommandNormalizer.canonicalize(candidate.text), false);
         }
     }
 
@@ -561,10 +593,13 @@ public final class HandsFreeVoiceService extends Service
         int bestScore = Integer.MIN_VALUE;
         for (int i = 0; i < matches.size(); i++) {
             String value = matches.get(i) == null ? "" : matches.get(i);
+            String canonical = AccentCommandNormalizer.canonicalize(value);
             float confidence = confidences != null && i < confidences.length
                     ? confidences[i] : -1f;
-            int score = CommandEngine.scoreRecognitionCandidate(value);
-            if (hasFlexibleWakeWord(value)) score += 80;
+            int score = CommandEngine.scoreRecognitionCandidate(canonical);
+            AppCatalog.AppMatch appMatch = AppCatalog.findBest(canonical);
+            if (appMatch != null) score += appMatch.score / 2;
+            if (hasFlexibleWakeWord(canonical)) score += 90;
             if (confidence >= 0f) score += Math.round(confidence * 30f);
             if (score > bestScore) {
                 bestScore = score;
@@ -581,27 +616,28 @@ public final class HandsFreeVoiceService extends Service
         long now = SystemClock.uptimeMillis();
         if (now < ignoreAudioUntil) return;
 
-        String cleaned = candidate == null ? "" : candidate.trim();
-        boolean hasWakeWord = hasFlexibleWakeWord(cleaned);
+        String canonical = AccentCommandNormalizer.canonicalize(candidate);
+        boolean hasWakeWord = hasFlexibleWakeWord(canonical);
         boolean commandWindow = commandWindowOpen();
 
         if (!hasWakeWord && !commandWindow) {
-            // Room sounds and other speakers are ignored without closing the continuous mic.
             if (!keepSegmentedSession) scheduleRestart(300L, false);
             return;
         }
-        if (!hasWakeWord && confidence >= 0f && confidence < 0.12f) {
+        if (!hasWakeWord && confidence >= 0f && confidence < 0.10f) {
             commandWindowUntil = 0L;
             broadcastStatus("آواز واضح نہیں", "دوبارہ کہیں: چنٹو، پھر کمانڈ", false);
             if (!keepSegmentedSession) scheduleRestart(350L, false);
             return;
         }
 
-        String command = hasWakeWord ? stripFlexibleWakeWord(cleaned) : cleaned;
+        String command = hasWakeWord ? stripFlexibleWakeWord(canonical) : canonical.trim();
         if (hasWakeWord && command.isEmpty()) {
-            commandWindowUntil = SystemClock.uptimeMillis() + COMMAND_WINDOW_MS;
-            broadcastStatus("جی، ذیشان", "بارہ سیکنڈ کے اندر کمانڈ بولیں", true);
-            if (!keepSegmentedSession) scheduleRestart(180L, false);
+            commandWindowUntil = 0L;
+            executingCommand = true;
+            stopRecognitionSession(true);
+            broadcastStatus("جی، ذیشان", "جو حکم، بولیں", true);
+            speakWithGuard("جی ذیشان، بولیں", SpeechPurpose.WAKE_ACKNOWLEDGEMENT);
             return;
         }
 
@@ -615,22 +651,24 @@ public final class HandsFreeVoiceService extends Service
         executingCommand = true;
         stopRecognitionSession(true);
         broadcastStatus("کمانڈ ملی", command, true);
+        String finalCommand = command;
         commandExecutor.execute(() -> {
             BackgroundCommandExecutor.Result result =
-                    BackgroundCommandExecutor.execute(getApplicationContext(), command);
+                    BackgroundCommandExecutor.execute(getApplicationContext(), finalCommand);
             handler.post(() -> {
-                broadcastCommand(command, result.message);
+                broadcastCommand(finalCommand, result.message);
                 if (result.stopHandsFree) {
                     stopHandsFree(result.message);
                 } else {
-                    speakThenRestart(result.message);
+                    speakWithGuard(result.message, SpeechPurpose.COMMAND_RESPONSE);
                 }
             });
         });
     }
 
     private boolean hasFlexibleWakeWord(String raw) {
-        String normalized = CommandEngine.normalize(raw);
+        String canonical = AccentCommandNormalizer.canonicalize(raw);
+        String normalized = CommandEngine.normalize(canonical);
         for (String prefix : WAKE_PREFIXES) {
             String normalizedPrefix = CommandEngine.normalize(prefix);
             if (normalized.equals(normalizedPrefix)
@@ -642,18 +680,10 @@ public final class HandsFreeVoiceService extends Service
     }
 
     private String stripFlexibleWakeWord(String raw) {
-        String normalized = CommandEngine.normalize(raw);
-        for (String prefix : WAKE_PREFIXES) {
-            String normalizedPrefix = CommandEngine.normalize(prefix);
-            if (normalized.equals(normalizedPrefix)) return "";
-            if (normalized.startsWith(normalizedPrefix + " ")) {
-                String remaining = normalized.substring(normalizedPrefix.length()).trim();
-                return remaining
-                        .replaceFirst("^(جی|سنو|بھائی|ذیشان)\\s+", "")
-                        .trim();
-            }
-        }
-        return normalized;
+        String canonical = AccentCommandNormalizer.canonicalize(raw).trim();
+        return canonical
+                .replaceFirst("(?iu)^(چنٹو|چنتو|چینٹو|چین تو|چن ٹو|جنٹو|جن تو|چندو|chintu|chintoo)(\\s+جی|\\s+سنو|\\s+بھائی|\\s+ذیشان)?\\s*", "")
+                .trim();
     }
 
     private boolean looksLikeNoise(String command) {
@@ -672,52 +702,92 @@ public final class HandsFreeVoiceService extends Service
         return SystemClock.uptimeMillis() <= commandWindowUntil;
     }
 
-    private void speakThenRestart(String message) {
-        if (stopped) return;
-        if (!ttsReady || tts == null || message == null || message.trim().isEmpty()) {
-            finishSpeakingAndRestart();
+    private void speakWithGuard(String message, SpeechPurpose purpose) {
+        removeTtsWatchdog();
+        speechPurpose = purpose;
+        String text = message == null ? "" : message.trim();
+        if (text.isEmpty() || !ttsReady || tts == null) {
+            completeSpeech(purpose);
             return;
         }
+
+        activeUtteranceId = "chintu-" + (++utteranceSequence);
         try {
-            tts.speak(message, TextToSpeech.QUEUE_FLUSH, null, "hands-free-response");
+            tts.stop();
+            int result = tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, activeUtteranceId);
+            if (result == TextToSpeech.ERROR) {
+                completeSpeech(purpose);
+                return;
+            }
+            long timeout = Math.max(3_000L, Math.min(9_000L, 1_500L + text.length() * 90L));
+            SpeechPurpose expectedPurpose = purpose;
+            String expectedId = activeUtteranceId;
+            ttsWatchdog = () -> {
+                if (expectedId.equals(activeUtteranceId)) completeSpeech(expectedPurpose);
+            };
+            handler.postDelayed(ttsWatchdog, timeout);
         } catch (RuntimeException error) {
-            finishSpeakingAndRestart();
+            completeSpeech(purpose);
         }
     }
 
-    private void finishSpeakingAndRestart() {
-        ignoreAudioUntil = SystemClock.uptimeMillis() + IGNORE_AFTER_TTS_MS;
+    private void completeSpeech(SpeechPurpose completedPurpose) {
+        removeTtsWatchdog();
+        activeUtteranceId = "";
+        speechPurpose = SpeechPurpose.NONE;
+        long now = SystemClock.uptimeMillis();
+        ignoreAudioUntil = now + IGNORE_AFTER_TTS_MS;
         executingCommand = false;
-        scheduleRestart(IGNORE_AFTER_TTS_MS, true);
+        if (completedPurpose == SpeechPurpose.WAKE_ACKNOWLEDGEMENT) {
+            commandWindowUntil = now + COMMAND_WINDOW_MS;
+            broadcastStatus("جی، بولیں", "بارہ سیکنڈ کے اندر مکمل کمانڈ بولیں", true);
+            scheduleRestart(IGNORE_AFTER_TTS_MS, false);
+        } else {
+            commandWindowUntil = 0L;
+            scheduleRestart(IGNORE_AFTER_TTS_MS, true);
+        }
     }
 
     @Override
     public void onInit(int status) {
-        if (status != TextToSpeech.SUCCESS || tts == null) return;
-        int language = tts.setLanguage(new Locale("ur", "PK"));
-        if (language == TextToSpeech.LANG_MISSING_DATA
-                || language == TextToSpeech.LANG_NOT_SUPPORTED) {
-            tts.setLanguage(Locale.getDefault());
+        if (status != TextToSpeech.SUCCESS || tts == null) {
+            ttsReady = false;
+            return;
         }
-        tts.setSpeechRate(0.92f);
-        tts.setPitch(0.9f);
+        ChintuVoiceProfile.Selection selection = ChintuVoiceProfile.configure(tts);
         tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
             @Override
             public void onStart(String utteranceId) {
-                // Recognition is closed while Chintu speaks, preventing feedback commands.
+                // Recognition remains closed while Chintu speaks.
             }
 
             @Override
             public void onDone(String utteranceId) {
-                handler.post(HandsFreeVoiceService.this::finishSpeakingAndRestart);
+                handler.post(() -> finishUtteranceIfCurrent(utteranceId));
             }
 
             @Override
             public void onError(String utteranceId) {
-                handler.post(HandsFreeVoiceService.this::finishSpeakingAndRestart);
+                handler.post(() -> finishUtteranceIfCurrent(utteranceId));
+            }
+
+            @Override
+            public void onError(String utteranceId, int errorCode) {
+                handler.post(() -> finishUtteranceIfCurrent(utteranceId));
             }
         });
-        ttsReady = true;
+        ttsReady = selection.configured || tts.getVoice() != null;
+    }
+
+    private void finishUtteranceIfCurrent(String utteranceId) {
+        if (utteranceId == null || !utteranceId.equals(activeUtteranceId)) return;
+        SpeechPurpose completed = speechPurpose;
+        completeSpeech(completed);
+    }
+
+    private void removeTtsWatchdog() {
+        if (ttsWatchdog != null) handler.removeCallbacks(ttsWatchdog);
+        ttsWatchdog = null;
     }
 
     private long nextFallbackDelay() {
@@ -828,8 +898,10 @@ public final class HandsFreeVoiceService extends Service
     private void stopHandsFree(String status) {
         stopped = true;
         executingCommand = false;
+        speechPurpose = SpeechPurpose.NONE;
         setEnabled(false);
         clearTimers();
+        removeTtsWatchdog();
         destroyRecognizer();
         releaseWakeLock();
         if (tts != null) tts.stop();
@@ -899,6 +971,7 @@ public final class HandsFreeVoiceService extends Service
         executingCommand = false;
         setEnabled(false);
         clearTimers();
+        removeTtsWatchdog();
         destroyRecognizer();
         releaseWakeLock();
         commandExecutor.shutdownNow();
