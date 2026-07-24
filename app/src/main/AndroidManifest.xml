@@ -8,41 +8,94 @@
 
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.flash" android:required="false" />
 
     <queries>
         <package android:name="com.google.android.youtube" />
         <package android:name="com.whatsapp" />
         <package android:name="com.whatsapp.w4b" />
         <package android:name="com.instagram.android" />
+        <package android:name="com.instagram.barcelona" />
         <package android:name="com.facebook.katana" />
+        <package android:name="com.facebook.lite" />
+        <package android:name="com.facebook.orca" />
+        <package android:name="com.zhiliaoapp.musically" />
+        <package android:name="com.ss.android.ugc.trill" />
+        <package android:name="com.twitter.android" />
+        <package android:name="org.telegram.messenger" />
+        <package android:name="com.snapchat.android" />
+        <package android:name="com.pinterest" />
+        <package android:name="com.canva.editor" />
+        <package android:name="com.lemon.lvoverseas" />
+        <package android:name="com.spotify.music" />
         <package android:name="com.google.android.apps.maps" />
         <package android:name="com.google.android.gm" />
         <package android:name="com.google.android.apps.photos" />
+        <package android:name="com.google.android.apps.nbu.files" />
         <package android:name="com.miui.gallery" />
+        <package android:name="com.android.fileexplorer" />
         <package android:name="com.miui.calculator" />
         <package android:name="com.google.android.calculator" />
         <package android:name="com.android.chrome" />
         <package android:name="com.mi.globalbrowser" />
         <package android:name="com.android.vending" />
-        <intent><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent>
-        <intent><action android:name="android.speech.action.RECOGNIZE_SPEECH" /></intent>
-        <intent><action android:name="android.media.action.IMAGE_CAPTURE" /></intent>
-        <intent><action android:name="android.intent.action.DIAL" /><data android:scheme="tel" /></intent>
-        <intent><action android:name="android.intent.action.SENDTO" /><data android:scheme="smsto" /></intent>
-        <intent><action android:name="android.intent.action.VIEW" /><data android:scheme="geo" /></intent>
-        <intent><action android:name="android.intent.action.VIEW" /><data android:scheme="https" /></intent>
+
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+        <intent>
+            <action android:name="android.speech.action.RECOGNIZE_SPEECH" />
+        </intent>
+        <intent>
+            <action android:name="android.media.action.STILL_IMAGE_CAMERA" />
+        </intent>
+        <intent>
+            <action android:name="android.media.action.IMAGE_CAPTURE" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.DIAL" />
+            <data android:scheme="tel" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SENDTO" />
+            <data android:scheme="smsto" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="geo" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="https" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SEND" />
+            <data android:mimeType="text/plain" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SET_ALARM" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SET_TIMER" />
+        </intent>
     </queries>
 
     <application
-        android:allowBackup="true"
+        android:allowBackup="false"
+        android:enableOnBackInvokedCallback="true"
         android:forceDarkAllowed="false"
+        android:hardwareAccelerated="true"
         android:label="Chintu AI"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.NoActionBar"
         android:usesCleartextTraffic="false">
 
         <activity
-            android:name=".StableChintuActivity"
+            android:name=".ChintuActivity"
             android:exported="true"
             android:launchMode="singleTop"
             android:screenOrientation="portrait"
