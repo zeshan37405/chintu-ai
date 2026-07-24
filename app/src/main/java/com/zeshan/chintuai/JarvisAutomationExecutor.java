@@ -4,6 +4,8 @@ import android.content.Context;
 import android.content.SharedPreferences;
 import android.os.SystemClock;
 
+import java.util.Locale;
+
 /**
  * Parses and executes screen-level voice commands. High-impact actions are always staged and
  * require an explicit second confirmation command.
@@ -69,14 +71,14 @@ public final class JarvisAutomationExecutor {
                     "انٹر دبا دیا ہے", "انٹر کا عمل نہیں ہوا");
         }
 
-        String typedText = extractAfterAny(raw,
+        String typedText = extractAfterAnyPreservingText(raw,
                 "یہ ٹائپ کرو", "ٹائپ کرو", "یہ لکھو", "لکھو", "type this", "type", "write this");
         if (!typedText.isEmpty()) {
             return accessibilityResult(ChintuAccessibilityService.typeIntoFocusedField(typedText),
                     "متن لکھ دیا ہے", "پہلے لکھنے والی جگہ منتخب کریں");
         }
 
-        String clickTarget = extractAfterAny(raw,
+        String clickTarget = extractAfterAnyPreservingText(raw,
                 "اس پر کلک کرو", "کلک کرو", "اسے دباؤ", "دباؤ", "tap", "click");
         if (!clickTarget.isEmpty()) {
             if (isHighImpactTarget(clickTarget)) {
@@ -147,14 +149,17 @@ public final class JarvisAutomationExecutor {
                 : BackgroundCommandExecutor.Result.fail(failureMessage);
     }
 
-    private static String extractAfterAny(String raw, String... markers) {
-        String normalized = CommandEngine.normalize(CommandEngine.stripWakeWord(raw));
+    private static String extractAfterAnyPreservingText(String raw, String... markers) {
+        if (raw == null) return "";
+        String source = raw.trim().replaceFirst(
+                "(?iu)^(چنٹو|چنتو|chintu)(\\s+جی|\\s+سنو|\\s+بھائی)?\\s*", "");
+        String lowerSource = source.toLowerCase(Locale.ROOT);
         for (String marker : markers) {
-            String normalizedMarker = CommandEngine.normalize(marker);
-            int index = normalized.indexOf(normalizedMarker);
+            String lowerMarker = marker.toLowerCase(Locale.ROOT);
+            int index = lowerSource.indexOf(lowerMarker);
             if (index < 0) continue;
-            String value = normalized.substring(index + normalizedMarker.length()).trim();
-            value = value.replaceFirst("^(کہ|کہو|یہ|متن|text)\\s+", "").trim();
+            String value = source.substring(index + marker.length()).trim();
+            value = value.replaceFirst("(?iu)^(کہ|کہو|یہ|متن|text)\\s+", "").trim();
             if (!value.isEmpty()) return value;
         }
         return "";
