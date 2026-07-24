@@ -7,6 +7,9 @@ on:
   pull_request:
     branches: ["main"]
 
+permissions:
+  contents: read
+
 concurrency:
   group: chintu-android-${{ github.ref }}
   cancel-in-progress: true
@@ -14,7 +17,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -37,15 +40,36 @@ jobs:
         with:
           gradle-version: "9.5.0"
 
-      - name: Validate and build APK
-        run: gradle lintDebug assembleDebug --stacktrace --no-daemon
+      - name: Reject embedded secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -RInE --exclude-dir=build --exclude='*.md' '(AIza[0-9A-Za-z_-]{20,}|sk-[0-9A-Za-z_-]{20,})' app; then
+            echo "Potential API secret found in app sources"
+            exit 1
+          fi
+
+      - name: Unit tests, lint and APK
+        run: gradle clean testDebugUnitTest lintDebug assembleDebug --stacktrace --no-daemon
+
+      - name: Verify APK exists
+        run: test -s app/build/outputs/apk/debug/app-debug.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: chintu-ai-debug-apk
+          name: chintu-ai-3.0.0-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload unit-test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chintu-ai-unit-tests
+          path: app/build/reports/tests/testDebugUnitTest/
+          if-no-files-found: ignore
           retention-days: 14
 
       - name: Upload lint report
