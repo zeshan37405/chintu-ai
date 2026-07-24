@@ -10,8 +10,8 @@ android {
         applicationId 'com.zeshan.chintuai'
         minSdk 26
         targetSdk 36
-        versionCode 9
-        versionName '2.1.0'
+        versionCode 10
+        versionName '3.0.0'
     }
 
     compileOptions {
@@ -19,8 +19,17 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
 
+    buildFeatures {
+        buildConfig true
+    }
+
+    testOptions {
+        unitTests.returnDefaultValues = true
+    }
+
     lint {
         abortOnError true
+        checkDependencies true
         checkReleaseBuilds true
         warningsAsErrors false
     }
@@ -35,4 +44,8 @@ android {
             minifyEnabled false
         }
     }
+}
+
+dependencies {
+    testImplementation 'junit:junit:4.13.2'
 }
