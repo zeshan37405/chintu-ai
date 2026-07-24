@@ -105,11 +105,15 @@ public final class AppCatalog {
     }
 
     private static String replaceAny(String source, String canonical, String... values) {
-        String result = source;
+        String canonicalKey = CommandEngine.normalize(canonical);
+        if (canonicalKey.isEmpty() || source.contains(canonicalKey)) return source;
         for (String value : values) {
-            result = result.replace(CommandEngine.normalize(value), canonical);
+            String key = CommandEngine.normalize(value);
+            if (!key.isEmpty() && source.contains(key)) {
+                return source.replace(key, canonicalKey);
+            }
         }
-        return result;
+        return source;
     }
 
     private static List<AppSpec> buildApps() {
