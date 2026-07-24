@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: chintu-android-${{ github.ref }}
+  group: wazir-android-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -58,7 +58,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: chintu-ai-3.3.2-anr-safe-debug-apk
+          name: wazir-gen-z-4.0.0-fast-voice-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14
@@ -67,7 +67,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: chintu-ai-unit-tests
+          name: wazir-unit-tests
           path: app/build/reports/tests/testDebugUnitTest/
           if-no-files-found: ignore
           retention-days: 14
@@ -76,7 +76,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: chintu-ai-lint-report
+          name: wazir-lint-report
           path: app/build/reports/lint-results-debug.html
           if-no-files-found: ignore
           retention-days: 14
