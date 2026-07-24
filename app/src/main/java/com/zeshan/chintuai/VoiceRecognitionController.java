@@ -83,6 +83,7 @@ public final class VoiceRecognitionController {
     public void prepare() {
         runOnMain(() -> {
             if (released || !foreground || recognizer != null) return;
+            if (HandsFreeVoiceService.isEnabled(context)) return;
             if (!SpeechRecognizer.isRecognitionAvailable(context)) return;
             try {
                 recognizer = SpeechRecognizer.createSpeechRecognizer(context);
@@ -107,6 +108,11 @@ public final class VoiceRecognitionController {
     public void start() {
         runOnMain(() -> {
             if (released) return;
+            if (HandsFreeVoiceService.isEnabled(context)) {
+                callback.onVoiceState(State.IDLE, "ہینڈز فری چل رہا ہے",
+                        "بٹن کی ضرورت نہیں، سیدھا کمانڈ بولیں");
+                return;
+            }
             if (!foreground) {
                 callback.onVoiceUnavailable("ایپ سامنے آنے کے بعد دوبارہ کوشش کریں");
                 return;
@@ -120,7 +126,11 @@ public final class VoiceRecognitionController {
     }
 
     public void cancel(String detail) {
-        runOnMain(() -> cancelInternal(true, detail));
+        runOnMain(() -> {
+            boolean silent = detail == null || detail.trim().isEmpty();
+            cancelInternal(!silent, detail);
+            if (silent) destroyRecognizer();
+        });
     }
 
     public void onSystemResult(List<String> matches) {
