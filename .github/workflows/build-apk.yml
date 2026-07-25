@@ -3,7 +3,7 @@ name: Build Android APK
 on:
   workflow_dispatch:
   push:
-    branches: ["main", "feature/wazir-gen-z-5.0-live-voice"]
+    branches: ["main", "fix/wazir-live-handshake-5.0.1"]
   pull_request:
     branches: ["main"]
 
@@ -50,7 +50,10 @@ jobs:
           fi
 
       - name: Unit tests, lint and APK
-        run: gradle clean testDebugUnitTest lintDebug assembleDebug --stacktrace --no-daemon
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle clean testDebugUnitTest lintDebug assembleDebug --stacktrace --no-daemon 2>&1 | tee build.log
 
       - name: Verify APK exists
         run: test -s app/build/outputs/apk/debug/app-debug.apk
@@ -58,9 +61,18 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: wazir-gen-z-5.0.0-gemini-live-voice-debug-apk
+          name: wazir-gen-z-5.0.1-live-handshake-diagnostic-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wazir-5.0.1-build-log
+          path: build.log
+          if-no-files-found: ignore
           retention-days: 14
 
       - name: Upload unit-test report

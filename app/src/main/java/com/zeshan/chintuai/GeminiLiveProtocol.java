@@ -6,12 +6,23 @@ import org.json.JSONObject;
 
 /** Builds and parses the raw Gemini Live WebSocket messages used by Wazir. */
 public final class GeminiLiveProtocol {
-    public static final String MODEL = "gemini-3.1-flash-live-preview";
-    public static final String FUNCTION_NAME = "execute_phone_actions";
+    /** Current Live model, followed by the older free-tier-compatible native-audio model. */
+    public static final String[] MODELS = {
+            "gemini-3.1-flash-live-preview",
+            "gemini-2.5-flash-native-audio-preview-12-2025"
+    };
+    /** Compatibility alias used by the existing structured-action bridge. */
+    public static final String MODEL = MODELS[0];
     public static final int INPUT_SAMPLE_RATE = 16_000;
+    /** Retained for the dormant native-audio player class; 5.0.1 uses Live for transcription. */
     public static final int OUTPUT_SAMPLE_RATE = 24_000;
 
     private GeminiLiveProtocol() {
+    }
+
+    public static String modelAt(int index) {
+        int safe = Math.max(0, Math.min(index, MODELS.length - 1));
+        return MODELS[safe];
     }
 
     public static String webSocketUrl(String apiKey) {
@@ -20,31 +31,27 @@ public final class GeminiLiveProtocol {
                 + "?key=" + apiKey;
     }
 
-    public static String setupMessage(boolean directMode) throws JSONException {
+    /**
+     * Minimal setup matching Google's current raw-WebSocket quickstart. Live transcribes the
+     * microphone; the existing Gemini REST brain plans and executes Android actions after the turn.
+     */
+    public static String setupMessage(boolean directMode, String model) throws JSONException {
         JSONObject setup = new JSONObject();
-        setup.put("model", "models/" + MODEL);
-        setup.put("generationConfig", new JSONObject()
-                .put("responseModalities", new JSONArray().put("AUDIO"))
-                .put("speechConfig", new JSONObject()
-                        .put("voiceConfig", new JSONObject()
-                                .put("prebuiltVoiceConfig", new JSONObject()
-                                        .put("voiceName", "Gacrux")))));
+        setup.put("model", "models/" + model);
+        setup.put("responseModalities", new JSONArray().put("AUDIO"));
         setup.put("systemInstruction", new JSONObject()
-                .put("parts", new JSONArray().put(new JSONObject()
-                        .put("text", systemInstruction(directMode)))));
-        setup.put("tools", new JSONArray().put(new JSONObject()
-                .put("functionDeclarations", new JSONArray().put(functionDeclaration()))));
+                .put("parts", new JSONArray().put(new JSONObject().put("text",
+                        systemInstruction(directMode)))));
+        setup.put("inputAudioTranscription", new JSONObject());
         setup.put("realtimeInputConfig", new JSONObject()
                 .put("automaticActivityDetection", new JSONObject()
                         .put("disabled", false)
                         .put("startOfSpeechSensitivity", "START_SENSITIVITY_HIGH")
                         .put("endOfSpeechSensitivity", "END_SENSITIVITY_LOW")
-                        .put("prefixPaddingMs", 300)
-                        .put("silenceDurationMs", 800))
+                        .put("prefixPaddingMs", 250)
+                        .put("silenceDurationMs", 1_200))
                 .put("activityHandling", "START_OF_ACTIVITY_INTERRUPTS")
                 .put("turnCoverage", "TURN_INCLUDES_ONLY_ACTIVITY"));
-        setup.put("inputAudioTranscription", new JSONObject());
-        setup.put("outputAudioTranscription", new JSONObject());
         return new JSONObject().put("setup", setup).toString();
     }
 
@@ -63,115 +70,29 @@ public final class GeminiLiveProtocol {
                 new JSONObject().put("audioStreamEnd", true)).toString();
     }
 
-    public static String toolResponse(String id, String name,
-                                      BackgroundCommandExecutor.Result result,
-                                      String diagnostic) throws JSONException {
-        JSONObject response = new JSONObject()
-                .put("ok", result != null && result.handled)
-                .put("message", result == null ? "کمانڈ مکمل نہیں ہوئی" : result.message)
-                .put("stopHandsFree", result != null && result.stopHandsFree)
-                .put("diagnostic", diagnostic == null ? "" : diagnostic);
-        JSONObject functionResponse = new JSONObject()
-                .put("id", id == null ? "" : id)
-                .put("name", name == null || name.isEmpty() ? FUNCTION_NAME : name)
-                .put("response", response);
-        return new JSONObject().put("toolResponse", new JSONObject()
-                .put("functionResponses", new JSONArray().put(functionResponse))).toString();
-    }
-
-    public static GeminiActionPlan parsePlan(JSONObject args) {
-        if (args == null) return GeminiActionPlan.speakOnly("Gemini action plan خالی تھا");
-        return GeminiActionPlan.fromFunctionArgs(args);
-    }
-
-    public static String heardText(JSONObject args) {
-        return args == null ? "" : args.optString("heard_text", "").trim();
-    }
-
-    private static JSONObject functionDeclaration() throws JSONException {
-        JSONArray actionTypes = new JSONArray()
-                .put("OPEN_APP")
-                .put("SCROLL")
-                .put("SWIPE")
-                .put("TYPE_TEXT")
-                .put("CLICK_TEXT")
-                .put("BACK")
-                .put("HOME")
-                .put("RECENTS")
-                .put("CALL_CONTACT")
-                .put("MESSAGE_CONTACT")
-                .put("DRAFT_SOCIAL_POST")
-                .put("GOOGLE_SEARCH")
-                .put("STAGE_SUBMIT")
-                .put("CONFIRM")
-                .put("CANCEL")
-                .put("LOCAL_COMMAND")
-                .put("SPEAK")
-                .put("WAIT");
-
-        JSONObject actionProperties = new JSONObject()
-                .put("type", new JSONObject()
-                        .put("type", "string")
-                        .put("enum", actionTypes)
-                        .put("description", "Exact safe Android action type"))
-                .put("target", new JSONObject()
-                        .put("type", "string")
-                        .put("description", "App, contact or visible button name"))
-                .put("text", new JSONObject()
-                        .put("type", "string")
-                        .put("description", "Text to type, draft or speak"))
-                .put("direction", new JSONObject()
-                        .put("type", "string")
-                        .put("description", "up, down, left or right"))
-                .put("query", new JSONObject()
-                        .put("type", "string")
-                        .put("description", "Search query or exact local command"))
-                .put("delay_ms", new JSONObject()
-                        .put("type", "integer")
-                        .put("description", "Optional delay from 0 to 5000 milliseconds"));
-
-        JSONObject action = new JSONObject()
-                .put("type", "object")
-                .put("properties", actionProperties)
-                .put("required", new JSONArray().put("type"));
-
-        JSONObject parameters = new JSONObject()
-                .put("type", "object")
-                .put("properties", new JSONObject()
-                        .put("heard_text", new JSONObject()
-                                .put("type", "string")
-                                .put("description", "Exact user speech transcript, including the wake word"))
-                        .put("reply", new JSONObject()
-                                .put("type", "string")
-                                .put("description", "Very short Urdu acknowledgement"))
-                        .put("actions", new JSONObject()
-                                .put("type", "array")
-                                .put("items", action)
-                                .put("description", "Ordered Android actions, maximum six")))
-                .put("required", new JSONArray()
-                        .put("heard_text")
-                        .put("reply")
-                        .put("actions"));
-
-        return new JSONObject()
-                .put("name", FUNCTION_NAME)
-                .put("description", "Execute a safe ordered Wazir Android phone action plan")
-                .put("parameters", parameters);
+    public static String errorSummary(JSONObject root) {
+        if (root == null) return "";
+        JSONObject error = root.optJSONObject("error");
+        if (error == null) return "";
+        int code = error.optInt("code", -1);
+        String status = error.optString("status", "").trim();
+        String message = error.optString("message", "Gemini Live setup failed").trim();
+        StringBuilder value = new StringBuilder("Gemini");
+        if (code >= 0) value.append(" ").append(code);
+        if (!status.isEmpty()) value.append(" ").append(status);
+        if (!message.isEmpty()) value.append(": ").append(message);
+        String result = value.toString();
+        return result.length() > 420 ? result.substring(0, 420) : result;
     }
 
     private static String systemInstruction(boolean directMode) {
         String mode = directMode
-                ? "This is a direct one-command microphone session. The next clear request may omit the wake word."
-                : "This is hands-free mode. You MUST remain completely silent and MUST NOT call any function unless the user's speech begins with the wake word وزیر, وزیر جی, Wazir, Wazeer or Vazir.";
-        return "You are Wazir, Zeeshan's Urdu-first Android voice operating assistant. "
-                + mode + " Listen to the entire sentence and tolerate natural pauses. Do not act on fragments. "
-                + "When a complete actionable request is heard, call execute_phone_actions exactly once. "
-                + "Copy the complete speech into heard_text. Return no more than six ordered actions. "
-                + "Use OPEN_APP before screen actions when an app is named. Use SCROLL after the app is open. "
-                + "Use DRAFT_SOCIAL_POST to prepare text but never publish it automatically. "
-                + "Post, Send and Publish must use STAGE_SUBMIT and wait for a separate explicit confirmation. "
-                + "Banking, payments, purchases, money transfer, PIN, password, OTP and account-security changes "
-                + "are forbidden; use SPEAK to refuse. Never claim an action succeeded before the tool result. "
-                + "Keep spoken replies short, calm, deep and in Pakistani Urdu. Do not repeat the user's full command.";
+                ? "This is a direct one-command microphone session. The next complete request may omit the wake word."
+                : "This is hands-free mode. Ignore speech that does not begin with the wake word وزیر, وزیر جی, Wazir, Wazeer or Vazir.";
+        return "You are Wazir, Zeeshan's Urdu-first Android voice assistant. "
+                + mode + " Listen to the entire sentence and tolerate natural pauses. "
+                + "Do not call tools in this Live session. The Android app will use the input transcription after the user's turn ends. "
+                + "Give at most one very short Urdu acknowledgement so turnComplete is emitted. Never repeat the full command. "
+                + "Never ask for PIN, password, OTP or payment information.";
     }
 }
