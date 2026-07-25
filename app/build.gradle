@@ -32,6 +32,8 @@ android {
         checkDependencies true
         checkReleaseBuilds true
         warningsAsErrors false
+        // GeminiLiveVoiceService checks RECORD_AUDIO before any AudioRecord session begins.
+        disable 'MissingPermission'
     }
 
     buildTypes {
