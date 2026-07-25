@@ -45,10 +45,6 @@ public final class GeminiLiveProtocol {
                 .put("turnCoverage", "TURN_INCLUDES_ONLY_ACTIVITY"));
         setup.put("inputAudioTranscription", new JSONObject());
         setup.put("outputAudioTranscription", new JSONObject());
-        setup.put("contextWindowCompression", new JSONObject()
-                .put("slidingWindow", new JSONObject().put("targetTokens", 8_000))
-                .put("triggerTokens", 16_000));
-        setup.put("sessionResumption", new JSONObject());
         return new JSONObject().put("setup", setup).toString();
     }
 
