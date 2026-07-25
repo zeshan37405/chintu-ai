@@ -100,7 +100,7 @@ public final class JarvisAutomationExecutor {
             if (isHighImpactTarget(clickTarget)) {
                 savePending(context, "click", clickTarget);
                 return BackgroundCommandExecutor.Result.ok(
-                        "یہ حساس بٹن ہے۔ بیس سیکنڈ کے اندر کہیں: چنٹو تصدیق کرو");
+                        "یہ حساس بٹن ہے۔ بیس سیکنڈ کے اندر کہیں: وزیر تصدیق کرو");
             }
             return accessibilityResult(ChintuAccessibilityService.clickByVisibleText(clickTarget),
                     clickTarget + " دبا دیا ہے", clickTarget + " اسکرین پر نہیں ملا");
@@ -111,7 +111,7 @@ public final class JarvisAutomationExecutor {
                 "شائع کر دو", "publish", "post it", "send it")) {
             savePending(context, "submit", "");
             return BackgroundCommandExecutor.Result.ok(
-                    "پوسٹ یا سینڈ تیار ہے۔ بیس سیکنڈ کے اندر کہیں: چنٹو تصدیق کرو");
+                    "پوسٹ یا سینڈ تیار ہے۔ بیس سیکنڈ کے اندر کہیں: وزیر تصدیق کرو");
         }
 
         return null;
@@ -158,7 +158,7 @@ public final class JarvisAutomationExecutor {
             boolean success, String successMessage, String failureMessage) {
         if (!ChintuAccessibilityService.isConnected()) {
             return BackgroundCommandExecutor.Result.fail(
-                    "پورے فون کنٹرول کے لیے Chintu Accessibility سروس آن کریں");
+                    "پورے فون کنٹرول کے لیے Wazir phone control Accessibility سروس آن کریں");
         }
         return success
                 ? BackgroundCommandExecutor.Result.ok(successMessage)
@@ -168,7 +168,8 @@ public final class JarvisAutomationExecutor {
     private static String extractAfterAnyPreservingText(String raw, String... markers) {
         if (raw == null) return "";
         String source = raw.trim().replaceFirst(
-                "(?iu)^(چنٹو|چنتو|چینٹو|chintu)(\\s+جی|\\s+سنو|\\s+بھائی)?\\s*", "");
+                "(?iu)^(وزیر|wazir|wazeer|vazir|वज़ीर|वजीर|چنٹو|چنتو|چینٹو|chintu)"
+                        + "(\\s+جی|\\s+سنو|\\s+بھائی)?\\s*", "");
         String lowerSource = source.toLowerCase(Locale.ROOT);
         for (String marker : markers) {
             String lowerMarker = marker.toLowerCase(Locale.ROOT);
