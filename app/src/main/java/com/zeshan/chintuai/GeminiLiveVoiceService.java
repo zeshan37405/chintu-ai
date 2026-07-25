@@ -29,7 +29,6 @@ import android.os.PowerManager;
 import android.os.ResultReceiver;
 import android.os.SystemClock;
 
-import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
@@ -40,15 +39,14 @@ import okhttp3.Request;
 import okhttp3.Response;
 import okhttp3.WebSocket;
 import okhttp3.WebSocketListener;
-import okio.ByteString;
 
 /**
- * Wazir Gen Z 5.0 real-time voice core.
+ * Wazir Gen Z 5.0.1 transcript-first Gemini Live voice service.
  *
- * It does not use Android SpeechRecognizer or Google's two-second recognition dialog. Raw 16 kHz
- * PCM is streamed through a persistent Gemini Live WebSocket. Gemini returns live transcription,
- * native audio and structured tool calls. Android actions still execute inside the main process
- * through CommandExecutionReceiver, where the Accessibility safety layer lives.
+ * A WebSocket TCP upgrade is not called "connected" anymore. The microphone starts only after an
+ * actual setupComplete server message. Server JSON errors and WebSocket close codes are surfaced to
+ * the screen. Live performs continuous transcription; the existing Gemini REST brain converts the
+ * finished transcript into safe Android actions. This keeps the fragile Live handshake minimal.
  */
 public final class GeminiLiveVoiceService extends Service {
     public static final String ACTION_START_HANDS_FREE =
@@ -76,47 +74,44 @@ public final class GeminiLiveVoiceService extends Service {
     private static final String PREFS = "wazir_live_voice_preferences";
     private static final String PREF_HANDS_FREE = "live_hands_free_enabled";
     private static final String CHANNEL_ID = "wazir_gemini_live_voice";
-    private static final int NOTIFICATION_ID = 7500;
-    private static final long CONNECT_TIMEOUT_MS = 18_000L;
-    private static final long DIRECT_LISTEN_TIMEOUT_MS = 35_000L;
-    private static final long FALLBACK_DELAY_MS = 1_050L;
+    private static final int NOTIFICATION_ID = 7501;
+    private static final long SETUP_TIMEOUT_MS = 20_000L;
+    private static final long DIRECT_INITIAL_TIMEOUT_MS = 45_000L;
+    private static final long DIRECT_ACTIVE_TIMEOUT_MS = 20_000L;
+    private static final long TURN_SETTLE_MS = 650L;
     private static final long WAKE_LOCK_TIMEOUT_MS = 10L * 60L * 1_000L;
     private static final long WAKE_LOCK_RENEW_MS = 9L * 60L * 1_000L;
 
     private final Handler main = new Handler(Looper.getMainLooper());
 
-    private OkHttpClient httpClient;
-    private WebSocket webSocket;
-    private AudioRecord audioRecord;
+    private OkHttpClient client;
+    private WebSocket socket;
+    private AudioRecord recorder;
     private Thread audioThread;
     private AcousticEchoCanceler echoCanceler;
     private NoiseSuppressor noiseSuppressor;
     private AutomaticGainControl gainControl;
-    private PcmAudioPlayer audioPlayer;
     private PowerManager.WakeLock wakeLock;
 
     private volatile boolean active;
     private volatile boolean directMode;
+    private volatile boolean manualStop;
     private volatile boolean setupComplete;
     private volatile boolean recording;
-    private volatile boolean modelSpeaking;
+    private volatile boolean commandRunning;
     private volatile boolean audioStreamEnded;
-    private volatile boolean toolRunning;
-    private volatile boolean commandHandled;
-    private volatile boolean directFinished;
-    private volatile boolean manualStop;
 
     private int generation;
+    private int modelIndex;
     private int reconnectAttempt;
-    private int directRetryCount;
-    private String currentTranscript = "";
-    private String outputTranscript = "";
-    private long turnStartedAt;
+    private String activeModel = GeminiLiveProtocol.modelAt(0);
+    private String transcript = "";
+    private long speechStartedAt;
 
-    private Runnable connectWatchdog;
+    private Runnable setupWatchdog;
     private Runnable reconnectRunnable;
     private Runnable directTimeoutRunnable;
-    private Runnable fallbackRunnable;
+    private Runnable turnRunnable;
     private Runnable wakeLockRenewal;
 
     public static boolean isEnabled(Context context) {
@@ -128,18 +123,17 @@ public final class GeminiLiveVoiceService extends Service {
     public void onCreate() {
         super.onCreate();
         createNotificationChannel();
-        httpClient = new OkHttpClient.Builder()
+        client = new OkHttpClient.Builder()
                 .connectTimeout(15, TimeUnit.SECONDS)
                 .readTimeout(0, TimeUnit.MILLISECONDS)
                 .writeTimeout(20, TimeUnit.SECONDS)
                 .pingInterval(15, TimeUnit.SECONDS)
                 .retryOnConnectionFailure(true)
                 .build();
-        audioPlayer = new PcmAudioPlayer(this::onPlaybackState);
         PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
         if (power != null) {
             wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,
-                    "WazirGenZ:GeminiLiveVoice");
+                    "WazirGenZ:LiveTranscript");
             wakeLock.setReferenceCounted(false);
         }
     }
@@ -157,27 +151,30 @@ public final class GeminiLiveVoiceService extends Service {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
                 != PackageManager.PERMISSION_GRANTED) {
             setHandsFreeEnabled(false);
+            startAsForeground(direct);
             broadcastStatus("مائیکروفون اجازت نہیں",
-                    "وزیر کو Microphone اجازت دیں", true);
-            stopSelf();
+                    "Settings میں Microphone اجازت دیں", true);
+            main.postDelayed(this::stopSelf, 2_500L);
             return START_NOT_STICKY;
         }
         if (!WazirSecretStore.hasGeminiApiKey(this)) {
             setHandsFreeEnabled(false);
             startAsForeground(direct);
             broadcastStatus("Gemini key درکار ہے",
-                    "ایپ میں اپنی Gemini API key محفوظ کریں", true);
+                    "ایپ میں Gemini API key محفوظ کریں", true);
             main.postDelayed(this::stopSelf, 2_500L);
             return START_NOT_STICKY;
         }
 
         manualStop = false;
+        active = true;
         directMode = direct;
-        directRetryCount = 0;
+        modelIndex = 0;
+        reconnectAttempt = 0;
         setHandsFreeEnabled(!direct);
         startAsForeground(direct);
         acquireWakeLock();
-        connectNewSession();
+        connect();
         return direct ? START_NOT_STICKY : START_STICKY;
     }
 
@@ -186,126 +183,137 @@ public final class GeminiLiveVoiceService extends Service {
         return null;
     }
 
-    private void connectNewSession() {
-        if (manualStop) return;
-        active = true;
+    private void connect() {
+        if (!active || manualStop) return;
         int ticket = ++generation;
-        removeConnectWatchdog();
-        removeFallback();
-        removeDirectTimeout();
+        clearSessionTimers();
         stopAudioCapture();
         closeSocket();
         setupComplete = false;
-        modelSpeaking = false;
+        commandRunning = false;
         audioStreamEnded = false;
-        toolRunning = false;
-        commandHandled = false;
-        directFinished = false;
-        currentTranscript = "";
-        outputTranscript = "";
-        turnStartedAt = 0L;
+        transcript = "";
+        speechStartedAt = 0L;
 
         if (!hasNetwork()) {
             broadcastStatus("انٹرنیٹ دستیاب نہیں",
-                    "Gemini Live کے لیے Wi-Fi یا mobile data آن کریں", true);
-            scheduleReconnect(2_500L);
+                    "Wi-Fi یا mobile data آن کریں", true);
+            scheduleReconnect(3_000L);
             return;
         }
 
-        String apiKey = WazirSecretStore.getGeminiApiKey(this);
-        if (apiKey.isEmpty()) {
+        String key = WazirSecretStore.getGeminiApiKey(this);
+        if (key.isEmpty()) {
             stopLive("Gemini key دستیاب نہیں");
             return;
         }
+        activeModel = GeminiLiveProtocol.modelAt(modelIndex);
+        broadcastStatus("Gemini Live handshake",
+                activeModel + " سے setupComplete کا انتظار ہے", true);
 
-        broadcastStatus("Gemini Live جوڑ رہا ہوں",
-                directMode
-                        ? "براہِ راست کمانڈ کے لیے مائیک تیار ہو رہا ہے"
-                        : "مسلسل سننے والا وزیر تیار ہو رہا ہے",
-                true);
         Request request = new Request.Builder()
-                .url(GeminiLiveProtocol.webSocketUrl(apiKey))
+                .url(GeminiLiveProtocol.webSocketUrl(key))
                 .build();
-        webSocket = httpClient.newWebSocket(request, new WebSocketListener() {
+        socket = client.newWebSocket(request, new WebSocketListener() {
             @Override
-            public void onOpen(WebSocket socket, Response response) {
+            public void onOpen(WebSocket webSocket, Response response) {
                 if (ticket != generation || manualStop) {
-                    socket.close(1000, "stale session");
+                    webSocket.close(1000, "stale");
                     return;
                 }
                 try {
-                    socket.send(GeminiLiveProtocol.setupMessage(directMode));
-                    main.post(() -> broadcastStatus("Gemini Live connected",
-                            "Session setup مکمل ہو رہی ہے", false));
+                    boolean sent = webSocket.send(
+                            GeminiLiveProtocol.setupMessage(directMode, activeModel));
+                    main.post(() -> {
+                        if (!sent) {
+                            handleConnectionFailure(ticket,
+                                    "WebSocket کھلا مگر setup message send نہیں ہوئی");
+                        } else {
+                            broadcastStatus("WebSocket کھلا ہے",
+                                    "ابھی voice تیار نہیں؛ Gemini setupComplete کا انتظار ہے",
+                                    false);
+                        }
+                    });
                 } catch (JSONException error) {
-                    main.post(() -> handleSocketFailure(ticket,
-                            "Live setup message تیار نہیں ہوئی"));
+                    main.post(() -> handleConnectionFailure(ticket,
+                            "Live setup JSON تیار نہیں ہوئی"));
                 }
             }
 
             @Override
-            public void onMessage(WebSocket socket, String text) {
-                main.post(() -> handleSocketMessage(ticket, text));
+            public void onMessage(WebSocket webSocket, String text) {
+                main.post(() -> handleMessage(ticket, text));
             }
 
             @Override
-            public void onMessage(WebSocket socket, ByteString bytes) {
-                // Gemini Live currently sends JSON text frames. Ignore unexpected binary frames.
+            public void onClosing(WebSocket webSocket, int code, String reason) {
+                webSocket.close(code, reason);
             }
 
             @Override
-            public void onClosing(WebSocket socket, int code, String reason) {
-                socket.close(code, reason);
+            public void onClosed(WebSocket webSocket, int code, String reason) {
+                String detail = "WebSocket closed " + code;
+                if (reason != null && !reason.trim().isEmpty()) detail += ": " + reason.trim();
+                String finalDetail = detail;
+                main.post(() -> handleConnectionFailure(ticket, finalDetail));
             }
 
             @Override
-            public void onClosed(WebSocket socket, int code, String reason) {
-                main.post(() -> handleSocketFailure(ticket,
-                        reason == null || reason.isEmpty() ? "Live session بند ہوئی" : reason));
-            }
-
-            @Override
-            public void onFailure(WebSocket socket, Throwable error, Response response) {
-                String message = error == null || error.getMessage() == null
-                        ? "Gemini Live connection failed" : error.getMessage();
-                main.post(() -> handleSocketFailure(ticket, message));
+            public void onFailure(WebSocket webSocket, Throwable error, Response response) {
+                StringBuilder detail = new StringBuilder();
+                if (response != null) {
+                    detail.append("HTTP ").append(response.code())
+                            .append(" ").append(response.message());
+                }
+                if (error != null && error.getMessage() != null) {
+                    if (detail.length() > 0) detail.append(" — ");
+                    detail.append(error.getMessage());
+                }
+                if (detail.length() == 0) detail.append("Gemini Live connection failed");
+                String finalDetail = detail.toString();
+                main.post(() -> handleConnectionFailure(ticket, finalDetail));
             }
         });
 
-        connectWatchdog = () -> {
+        setupWatchdog = () -> {
             if (ticket != generation || setupComplete || manualStop) return;
-            handleSocketFailure(ticket, "Gemini Live connection timeout");
+            handleConnectionFailure(ticket,
+                    "20 سیکنڈ میں setupComplete نہیں آیا");
         };
-        main.postDelayed(connectWatchdog, CONNECT_TIMEOUT_MS);
+        main.postDelayed(setupWatchdog, SETUP_TIMEOUT_MS);
     }
 
-    private void handleSocketMessage(int ticket, String text) {
+    private void handleMessage(int ticket, String text) {
         if (ticket != generation || manualStop || text == null || text.isEmpty()) return;
         try {
             JSONObject root = new JSONObject(text);
+            String apiError = GeminiLiveProtocol.errorSummary(root);
+            if (!apiError.isEmpty()) {
+                handleConnectionFailure(ticket, apiError);
+                return;
+            }
             if (root.has("setupComplete")) {
                 setupComplete = true;
                 reconnectAttempt = 0;
-                removeConnectWatchdog();
+                removeSetupWatchdog();
                 startAudioCapture();
                 broadcastStatus(directMode ? "فوری Live Voice سن رہا ہے" : "وزیر Live تیار ہے",
                         directMode
-                                ? "پوری کمانڈ بولیں؛ 35 سیکنڈ کی listening window ہے"
-                                : "کہیں: وزیر، پھر پوری کمانڈ؛ درمیان میں قدرتی وقفہ کر سکتے ہیں",
+                                ? "پوری کمانڈ بولیں؛ 45 سیکنڈ کی window ہے"
+                                : "کہیں: وزیر، پھر پوری کمانڈ",
                         true);
-                if (directMode) armDirectTimeout();
+                if (directMode) armDirectTimeout(DIRECT_INITIAL_TIMEOUT_MS);
+                return;
             }
             JSONObject serverContent = root.optJSONObject("serverContent");
             if (serverContent != null) processServerContent(serverContent);
-            JSONObject toolCall = root.optJSONObject("toolCall");
-            if (toolCall != null) processToolCall(toolCall);
             if (root.has("goAway")) {
-                broadcastStatus("Gemini session تازہ کر رہا ہوں",
-                        "Live connection خودکار طور پر دوبارہ جڑ رہی ہے", false);
-                scheduleReconnect(450L);
+                broadcastStatus("Gemini session تازہ ہو رہی ہے",
+                        "Server نے reconnect کہا ہے", false);
+                scheduleReconnect(500L);
             }
         } catch (JSONException error) {
-            broadcastStatus("Gemini Live جواب پڑھا نہیں گیا",
+            broadcastStatus("Gemini جواب پڑھا نہیں گیا",
                     error.getClass().getSimpleName(), false);
         }
     }
@@ -315,104 +323,44 @@ public final class GeminiLiveVoiceService extends Service {
         if (input != null) {
             String update = input.optString("text", "").trim();
             if (!update.isEmpty()) {
-                if (turnStartedAt == 0L) turnStartedAt = SystemClock.uptimeMillis();
-                currentTranscript = LiveTranscriptGate.merge(currentTranscript, update);
-                removeDirectTimeout();
-                broadcastTranscript(currentTranscript);
-                broadcastStatus("سن رہا ہوں", currentTranscript, false);
+                if (speechStartedAt == 0L) speechStartedAt = SystemClock.uptimeMillis();
+                transcript = LiveTranscriptGate.merge(transcript, update);
+                broadcastTranscript(transcript);
+                broadcastStatus("سن رہا ہوں", transcript, false);
+                if (directMode) armDirectTimeout(DIRECT_ACTIVE_TIMEOUT_MS);
             }
         }
-
-        JSONObject output = content.optJSONObject("outputTranscription");
-        if (output != null) {
-            String update = output.optString("text", "").trim();
-            if (!update.isEmpty()) {
-                outputTranscript = LiveTranscriptGate.merge(outputTranscript, update);
-                broadcastStatus("وزیر جواب دے رہا ہے", outputTranscript, false);
-            }
+        if (content.optBoolean("turnComplete", false)) {
+            scheduleTurnExecution();
         }
-
-        JSONObject modelTurn = content.optJSONObject("modelTurn");
-        JSONArray parts = modelTurn == null ? null : modelTurn.optJSONArray("parts");
-        if (parts != null) {
-            for (int i = 0; i < parts.length(); i++) {
-                JSONObject part = parts.optJSONObject(i);
-                JSONObject inline = part == null ? null : part.optJSONObject("inlineData");
-                if (inline == null) continue;
-                String data = inline.optString("data", "");
-                if (data.isEmpty()) continue;
-                try {
-                    audioPlayer.enqueue(android.util.Base64.decode(
-                            data, android.util.Base64.DEFAULT));
-                } catch (IllegalArgumentException ignored) {
-                    // Ignore one malformed audio chunk and keep the session alive.
-                }
-            }
-        }
-
-        if (content.optBoolean("interrupted", false)) audioPlayer.stopNow();
-        if (content.optBoolean("turnComplete", false)) onTurnComplete();
     }
 
-    private void processToolCall(JSONObject toolCall) {
-        JSONArray calls = toolCall.optJSONArray("functionCalls");
-        if (calls == null) return;
-        for (int i = 0; i < calls.length(); i++) {
-            JSONObject call = calls.optJSONObject(i);
-            if (call == null) continue;
-            String name = call.optString("name", "");
-            String id = call.optString("id", "");
-            if (!GeminiLiveProtocol.FUNCTION_NAME.equals(name)) {
-                sendToolResponse(id, name,
-                        BackgroundCommandExecutor.Result.fail("یہ Live tool دستیاب نہیں"),
-                        "unsupported tool");
-                continue;
-            }
-            JSONObject args = call.optJSONObject("args");
-            if (args == null) {
-                try {
-                    args = new JSONObject(call.optString("args", "{}"));
-                } catch (JSONException ignored) {
-                    args = new JSONObject();
-                }
-            }
+    private void scheduleTurnExecution() {
+        removeTurnRunnable();
+        String snapshot = transcript.trim();
+        turnRunnable = () -> executeTranscript(snapshot);
+        main.postDelayed(turnRunnable, TURN_SETTLE_MS);
+    }
 
-            String heard = LiveTranscriptGate.merge(
-                    currentTranscript, GeminiLiveProtocol.heardText(args));
-            currentTranscript = heard;
-            if (!LiveTranscriptGate.isUsableCommand(heard, directMode)) {
-                sendToolResponse(id, name,
-                        BackgroundCommandExecutor.Result.fail(
-                                directMode ? "پوری کمانڈ واضح نہیں ملی" : "وزیر wake word نہیں ملا"),
-                        "wake gate rejected: " + heard);
-                commandHandled = false;
-                toolRunning = false;
-                broadcastStatus("سن رہا ہوں",
-                        directMode ? "پوری کمانڈ دوبارہ بولیں" : "پہلے کہیں: وزیر",
-                        false);
-                if (directMode) armDirectTimeout();
-                return;
-            }
-
-            String command = directMode
-                    ? heard.trim() : LiveTranscriptGate.commandAfterWakeWord(heard);
-            GeminiActionPlan plan = GeminiLiveProtocol.parsePlan(args);
-            executePlanThroughMainProcess(id, name, command, args.toString(), plan.actions.size());
+    private void executeTranscript(String snapshot) {
+        if (manualStop || commandRunning || snapshot == null) return;
+        String heard = snapshot.trim();
+        if (!LiveTranscriptGate.isUsableCommand(heard, directMode)) {
+            transcript = "";
+            speechStartedAt = 0L;
+            broadcastStatus(directMode ? "فوری Live Voice سن رہا ہے" : "وزیر Live تیار ہے",
+                    directMode ? "پوری کمانڈ واضح بولیں" : "پہلے کہیں: وزیر",
+                    false);
+            if (directMode) armDirectTimeout(DIRECT_ACTIVE_TIMEOUT_MS);
             return;
         }
-    }
 
-    private void executePlanThroughMainProcess(String toolId, String toolName,
-                                               String command, String planJson,
-                                               int actionCount) {
-        if (toolRunning || commandHandled) return;
-        toolRunning = true;
-        commandHandled = true;
-        removeFallback();
+        String command = directMode ? heard : LiveTranscriptGate.commandAfterWakeWord(heard);
+        commandRunning = true;
+        pauseAudioInput();
         removeDirectTimeout();
-        pauseAudioInput();
-        long started = turnStartedAt > 0L ? turnStartedAt : SystemClock.uptimeMillis();
-        broadcastStatus("عمل کر رہا ہوں", command, true);
+        long started = speechStartedAt > 0L ? speechStartedAt : SystemClock.uptimeMillis();
+        broadcastStatus("Gemini سمجھ رہا ہے", command, true);
 
         ResultReceiver reply = new ResultReceiver(main) {
             @Override
@@ -423,89 +371,24 @@ public final class GeminiLiveVoiceService extends Service {
                         CommandExecutionReceiver.RESULT_MESSAGE, "");
                 boolean stop = data != null && data.getBoolean(
                         CommandExecutionReceiver.RESULT_STOP_HANDS_FREE, false);
-                String mode = data == null ? "Gemini Live" : data.getString(
-                        CommandExecutionReceiver.RESULT_AI_MODE, "Gemini Live");
-                String diagnostic = data == null ? "" : data.getString(
-                        CommandExecutionReceiver.RESULT_DIAGNOSTIC, "");
-                BackgroundCommandExecutor.Result result =
-                        new BackgroundCommandExecutor.Result(handled, message, stop);
-                toolRunning = false;
-                directFinished = directMode;
-                long latency = Math.max(0L, SystemClock.uptimeMillis() - started);
-                sendToolResponse(toolId, toolName, result,
-                        "actions=" + actionCount + "; " + diagnostic);
-                broadcastCommand(command, result.message, mode, latency);
-                if (stop) {
-                    manualStop = true;
-                    stopLive(result.message);
-                }
-            }
-        };
-
-        Intent execution = new Intent(this, CommandExecutionReceiver.class)
-                .setAction(CommandExecutionReceiver.ACTION_EXECUTE)
-                .putExtra(CommandExecutionReceiver.EXTRA_COMMAND, command)
-                .putExtra(CommandExecutionReceiver.EXTRA_PLAN_JSON, planJson)
-                .putExtra(CommandExecutionReceiver.EXTRA_REPLY, reply);
-        try {
-            sendBroadcast(execution);
-        } catch (RuntimeException error) {
-            toolRunning = false;
-            BackgroundCommandExecutor.Result result = BackgroundCommandExecutor.Result.fail(
-                    "Android action bridge دستیاب نہیں");
-            sendToolResponse(toolId, toolName, result, error.getClass().getSimpleName());
-            broadcastCommand(command, result.message, "Bridge error", 0L);
-        }
-    }
-
-    private void executeTranscriptFallback(String snapshot) {
-        if (toolRunning || commandHandled || manualStop) return;
-        if (!LiveTranscriptGate.isUsableCommand(snapshot, directMode)) {
-            currentTranscript = "";
-            turnStartedAt = 0L;
-            if (directMode) {
-                broadcastStatus("فوری Live Voice سن رہا ہے",
-                        "پوری کمانڈ بولیں؛ session ابھی کھلا ہے", false);
-                armDirectTimeout();
-            } else {
-                broadcastStatus("وزیر Live تیار ہے",
-                        "کہیں: وزیر، پھر پوری کمانڈ", false);
-            }
-            return;
-        }
-        String command = directMode
-                ? snapshot.trim() : LiveTranscriptGate.commandAfterWakeWord(snapshot);
-        commandHandled = true;
-        toolRunning = true;
-        pauseAudioInput();
-        long started = turnStartedAt > 0L ? turnStartedAt : SystemClock.uptimeMillis();
-        broadcastStatus("Gemini fallback سمجھ رہا ہے", command, true);
-
-        ResultReceiver reply = new ResultReceiver(main) {
-            @Override
-            protected void onReceiveResult(int resultCode, Bundle data) {
-                boolean handled = data != null && data.getBoolean(
-                        CommandExecutionReceiver.RESULT_HANDLED, false);
-                String message = data == null ? "" : data.getString(
-                        CommandExecutionReceiver.RESULT_MESSAGE, "");
-                boolean stop = data != null && data.getBoolean(
-                        CommandExecutionReceiver.RESULT_STOP_HANDS_FREE, false);
-                String mode = data == null ? "Gemini fallback" : data.getString(
-                        CommandExecutionReceiver.RESULT_AI_MODE, "Gemini fallback");
-                toolRunning = false;
-                directFinished = directMode;
+                String mode = data == null ? "Gemini REST" : data.getString(
+                        CommandExecutionReceiver.RESULT_AI_MODE, "Gemini REST");
                 long latency = Math.max(0L, SystemClock.uptimeMillis() - started);
                 broadcastCommand(command, message, mode, latency);
+                commandRunning = false;
                 if (stop) {
                     manualStop = true;
                     stopLive(message);
                 } else if (directMode) {
-                    main.postDelayed(() -> stopLive("فوری Live command مکمل ہوئی"), 1_400L);
+                    main.postDelayed(() -> stopLive(
+                            handled ? "فوری command مکمل ہوئی" : "فوری command مکمل نہیں ہوئی"),
+                            1_500L);
                 } else {
                     resetForNextTurn();
                 }
             }
         };
+
         Intent execution = new Intent(this, CommandExecutionReceiver.class)
                 .setAction(CommandExecutionReceiver.ACTION_EXECUTE)
                 .putExtra(CommandExecutionReceiver.EXTRA_COMMAND, command)
@@ -513,52 +396,20 @@ public final class GeminiLiveVoiceService extends Service {
         try {
             sendBroadcast(execution);
         } catch (RuntimeException error) {
-            toolRunning = false;
-            commandHandled = false;
-            broadcastStatus("کمانڈ bridge نہیں چلا",
-                    error.getClass().getSimpleName(), true);
+            commandRunning = false;
+            broadcastCommand(command, "Android command bridge دستیاب نہیں",
+                    "Bridge error", 0L);
+            if (directMode) main.postDelayed(() -> stopLive("Bridge error"), 1_500L);
+            else resetForNextTurn();
         }
-    }
-
-    private void onTurnComplete() {
-        audioPlayer.markTurnComplete();
-        removeFallback();
-        String snapshot = currentTranscript;
-        if (commandHandled) {
-            if (directMode && directFinished) {
-                main.postDelayed(() -> stopLive("فوری Live command مکمل ہوئی"), 1_200L);
-            } else if (!directMode && !toolRunning) {
-                main.postDelayed(this::resetForNextTurn, 650L);
-            }
-            return;
-        }
-        fallbackRunnable = () -> executeTranscriptFallback(snapshot);
-        main.postDelayed(fallbackRunnable, FALLBACK_DELAY_MS);
     }
 
     private void resetForNextTurn() {
-        if (manualStop || !active) return;
-        currentTranscript = "";
-        outputTranscript = "";
-        turnStartedAt = 0L;
-        commandHandled = false;
-        toolRunning = false;
-        directFinished = false;
+        transcript = "";
+        speechStartedAt = 0L;
         audioStreamEnded = false;
         broadcastStatus("وزیر Live تیار ہے",
                 "کہیں: وزیر، پھر پوری کمانڈ", false);
-    }
-
-    private void sendToolResponse(String id, String name,
-                                  BackgroundCommandExecutor.Result result,
-                                  String diagnostic) {
-        WebSocket socket = webSocket;
-        if (socket == null) return;
-        try {
-            socket.send(GeminiLiveProtocol.toolResponse(id, name, result, diagnostic));
-        } catch (JSONException ignored) {
-            // The Android action has already been safely handled; keep the session alive.
-        }
     }
 
     private void startAudioCapture() {
@@ -567,29 +418,30 @@ public final class GeminiLiveVoiceService extends Service {
                 GeminiLiveProtocol.INPUT_SAMPLE_RATE,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT);
+        if (min <= 0) min = GeminiLiveProtocol.INPUT_SAMPLE_RATE * 2;
         int bufferSize = Math.max(min * 3, GeminiLiveProtocol.INPUT_SAMPLE_RATE * 2);
-        AudioRecord record = createAudioRecord(
-                MediaRecorder.AudioSource.VOICE_COMMUNICATION, bufferSize);
-        if (record == null || record.getState() != AudioRecord.STATE_INITIALIZED) {
-            if (record != null) record.release();
-            record = createAudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, bufferSize);
+
+        AudioRecord value = createRecorder(MediaRecorder.AudioSource.VOICE_RECOGNITION, bufferSize);
+        if (value == null || value.getState() != AudioRecord.STATE_INITIALIZED) {
+            if (value != null) value.release();
+            value = createRecorder(MediaRecorder.AudioSource.MIC, bufferSize);
         }
-        if (record == null || record.getState() != AudioRecord.STATE_INITIALIZED) {
-            if (record != null) record.release();
-            broadcastStatus("مائیکروفون شروع نہیں ہوا",
-                    "Redmi میں دوسری microphone app بند کریں", true);
-            scheduleReconnect(1_800L);
+        if (value == null || value.getState() != AudioRecord.STATE_INITIALIZED) {
+            if (value != null) value.release();
+            handleConnectionFailure(generation,
+                    "AudioRecord شروع نہیں ہوا؛ دوسری microphone app بند کریں");
             return;
         }
-        audioRecord = record;
-        enableAudioEffects(record.getAudioSessionId());
+
+        recorder = value;
+        enableAudioEffects(value.getAudioSessionId());
         recording = true;
-        audioThread = new Thread(this::audioLoop, "Wazir-GeminiLive-Audio");
+        audioThread = new Thread(this::audioLoop, "Wazir-Live-PCM");
         audioThread.setPriority(Thread.MAX_PRIORITY);
         audioThread.start();
     }
 
-    private AudioRecord createAudioRecord(int source, int bufferSize) {
+    private AudioRecord createRecorder(int source, int bufferSize) {
         try {
             return new AudioRecord.Builder()
                     .setAudioSource(source)
@@ -606,60 +458,194 @@ public final class GeminiLiveVoiceService extends Service {
     }
 
     private void audioLoop() {
-        AudioRecord record = audioRecord;
-        if (record == null) return;
-        byte[] chunk = new byte[3_200]; // 100 ms of 16 kHz mono PCM16.
+        AudioRecord value = recorder;
+        if (value == null) return;
+        byte[] buffer = new byte[3_200];
         try {
-            record.startRecording();
+            value.startRecording();
             while (recording && !manualStop) {
-                int read = record.read(chunk, 0, chunk.length, AudioRecord.READ_BLOCKING);
+                int read = value.read(buffer, 0, buffer.length, AudioRecord.READ_BLOCKING);
                 if (read <= 0) continue;
-                if (!setupComplete || modelSpeaking || toolRunning) {
-                    pauseAudioInput();
-                    continue;
-                }
+                if (!setupComplete || commandRunning) continue;
                 audioStreamEnded = false;
-                WebSocket socket = webSocket;
-                if (socket == null) continue;
+                WebSocket current = socket;
+                if (current == null) continue;
                 try {
-                    if (!socket.send(GeminiLiveProtocol.audioMessage(chunk, read))) {
-                        main.post(() -> scheduleReconnect(700L));
+                    if (!current.send(GeminiLiveProtocol.audioMessage(buffer, read))) {
+                        main.post(() -> handleConnectionFailure(generation,
+                                "Live audio send queue بند ہوئی"));
                     }
                 } catch (JSONException ignored) {
                 }
             }
         } catch (RuntimeException error) {
-            main.post(() -> {
-                broadcastStatus("مائیکروفون stream رک گئی",
-                        "خودکار recovery جاری ہے", false);
-                scheduleReconnect(900L);
-            });
+            main.post(() -> handleConnectionFailure(generation,
+                    "Microphone stream: " + error.getClass().getSimpleName()));
         }
     }
 
     private void pauseAudioInput() {
         if (audioStreamEnded) return;
         audioStreamEnded = true;
-        WebSocket socket = webSocket;
-        if (socket != null && setupComplete) {
+        WebSocket current = socket;
+        if (current != null && setupComplete) {
             try {
-                socket.send(GeminiLiveProtocol.audioStreamEndMessage());
+                current.send(GeminiLiveProtocol.audioStreamEndMessage());
             } catch (JSONException ignored) {
             }
         }
     }
 
-    private void onPlaybackState(boolean playing) {
-        modelSpeaking = playing;
-        if (playing) {
-            pauseAudioInput();
-        } else {
-            audioStreamEnded = false;
-            if (!directMode && active && !toolRunning) {
-                main.post(() -> broadcastStatus("وزیر Live تیار ہے",
-                        "کہیں: وزیر، پھر پوری کمانڈ", false));
-            }
+    private void handleConnectionFailure(int ticket, String reason) {
+        if (ticket != generation || manualStop || !active) return;
+        boolean failedBeforeSetup = !setupComplete;
+        setupComplete = false;
+        stopAudioCapture();
+        closeSocket();
+        removeSetupWatchdog();
+
+        String detail = clean(reason);
+        if (failedBeforeSetup && modelIndex + 1 < GeminiLiveProtocol.MODELS.length) {
+            modelIndex++;
+            activeModel = GeminiLiveProtocol.modelAt(modelIndex);
+            broadcastStatus("پہلا Live model نہیں جڑا",
+                    detail + " — اب " + activeModel + " آزما رہا ہوں", true);
+            scheduleReconnect(700L);
+            return;
         }
+
+        broadcastStatus("Gemini Live setup ناکام",
+                detail, true);
+        if (directMode) {
+            main.postDelayed(() -> stopLive("Live setup ناکام: " + detail), 4_000L);
+            return;
+        }
+        modelIndex = 0;
+        reconnectAttempt++;
+        long delay = Math.min(30_000L, 4_000L * Math.max(1, reconnectAttempt));
+        scheduleReconnect(delay);
+    }
+
+    private void scheduleReconnect(long delayMs) {
+        if (manualStop || !active) return;
+        if (reconnectRunnable != null) main.removeCallbacks(reconnectRunnable);
+        reconnectRunnable = this::connect;
+        main.postDelayed(reconnectRunnable, Math.max(400L, delayMs));
+    }
+
+    private void armDirectTimeout(long delayMs) {
+        removeDirectTimeout();
+        if (!directMode || manualStop || commandRunning) return;
+        directTimeoutRunnable = () -> {
+            if (!directMode || manualStop || commandRunning) return;
+            if (!transcript.trim().isEmpty()) {
+                executeTranscript(transcript);
+                return;
+            }
+            broadcastStatus("کمانڈ نہیں ملی",
+                    "Listening window مکمل ہوئی", true);
+            main.postDelayed(() -> stopLive("فوری listening مکمل ہوئی"), 1_800L);
+        };
+        main.postDelayed(directTimeoutRunnable, delayMs);
+    }
+
+    private boolean hasNetwork() {
+        ConnectivityManager manager =
+                (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+        if (manager == null) return true;
+        Network network = manager.getActiveNetwork();
+        if (network == null) return false;
+        NetworkCapabilities capabilities = manager.getNetworkCapabilities(network);
+        return capabilities != null
+                && capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
+    }
+
+    private void startAsForeground(boolean direct) {
+        Notification notification = buildNotification(direct
+                ? "فوری Live transcript"
+                : "کہیں: وزیر، پھر پوری کمانڈ");
+        if (Build.VERSION.SDK_INT >= 30) {
+            startForeground(NOTIFICATION_ID, notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE);
+        } else {
+            startForeground(NOTIFICATION_ID, notification);
+        }
+    }
+
+    private Notification buildNotification(String text) {
+        Intent open = new Intent(this, WazirGenZActivity.class)
+                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        PendingIntent openPending = PendingIntent.getActivity(this, 30, open,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        Intent stop = new Intent(this, GeminiLiveVoiceService.class).setAction(ACTION_STOP);
+        PendingIntent stopPending = PendingIntent.getService(this, 31, stop,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        return new Notification.Builder(this, CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                .setContentTitle("وزیر Gen Z — Live transcript")
+                .setContentText(text)
+                .setContentIntent(openPending)
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+                .setCategory(Notification.CATEGORY_SERVICE)
+                .addAction(new Notification.Action.Builder(
+                        android.R.drawable.ic_media_pause, "بند کریں", stopPending).build())
+                .build();
+    }
+
+    private void createNotificationChannel() {
+        NotificationChannel channel = new NotificationChannel(
+                CHANNEL_ID, "Wazir Live transcript", NotificationManager.IMPORTANCE_LOW);
+        channel.setDescription("وزیر کا Gemini Live microphone transcript");
+        channel.setSound(null, null);
+        NotificationManager manager = getSystemService(NotificationManager.class);
+        if (manager != null) manager.createNotificationChannel(channel);
+    }
+
+    private void broadcastStatus(String status, String detail, boolean force) {
+        sendBroadcast(new Intent(ACTION_STATUS)
+                .setPackage(getPackageName())
+                .putExtra(EXTRA_STATUS, status == null ? "" : status)
+                .putExtra(EXTRA_DETAIL, detail == null ? "" : detail)
+                .putExtra(EXTRA_ENGINE, "Gemini Live • " + activeModel)
+                .putExtra(EXTRA_MODE, directMode ? "Direct Live" : "Hands-free Live"));
+        NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        if (manager != null && active) {
+            manager.notify(NOTIFICATION_ID, buildNotification(
+                    status == null ? "وزیر Live" : status));
+        }
+    }
+
+    private void broadcastTranscript(String value) {
+        sendBroadcast(new Intent(ACTION_TRANSCRIPT)
+                .setPackage(getPackageName())
+                .putExtra(EXTRA_TRANSCRIPT, value == null ? "" : value)
+                .putExtra(EXTRA_ENGINE, "Gemini Live input transcription")
+                .putExtra(EXTRA_MODE, directMode ? "Direct Live" : "Hands-free Live"));
+    }
+
+    private void broadcastCommand(String command, String result, String mode, long latency) {
+        sendBroadcast(new Intent(ACTION_COMMAND)
+                .setPackage(getPackageName())
+                .putExtra(EXTRA_COMMAND, command == null ? "" : command)
+                .putExtra(EXTRA_RESULT, result == null ? "" : result)
+                .putExtra(EXTRA_ENGINE, "Live transcript → Gemini REST")
+                .putExtra(EXTRA_MODE, mode == null ? "Gemini" : mode)
+                .putExtra(EXTRA_LATENCY_MS, latency));
+    }
+
+    private void stopAudioCapture() {
+        recording = false;
+        AudioRecord value = recorder;
+        recorder = null;
+        if (value != null) {
+            try { value.stop(); } catch (RuntimeException ignored) { }
+            try { value.release(); } catch (RuntimeException ignored) { }
+        }
+        releaseAudioEffects();
+        Thread thread = audioThread;
+        audioThread = null;
+        if (thread != null) thread.interrupt();
     }
 
     private void enableAudioEffects(int sessionId) {
@@ -668,42 +654,19 @@ public final class GeminiLiveVoiceService extends Service {
                 echoCanceler = AcousticEchoCanceler.create(sessionId);
                 if (echoCanceler != null) echoCanceler.setEnabled(true);
             }
-        } catch (RuntimeException ignored) {
-        }
+        } catch (RuntimeException ignored) { }
         try {
             if (NoiseSuppressor.isAvailable()) {
                 noiseSuppressor = NoiseSuppressor.create(sessionId);
                 if (noiseSuppressor != null) noiseSuppressor.setEnabled(true);
             }
-        } catch (RuntimeException ignored) {
-        }
+        } catch (RuntimeException ignored) { }
         try {
             if (AutomaticGainControl.isAvailable()) {
                 gainControl = AutomaticGainControl.create(sessionId);
                 if (gainControl != null) gainControl.setEnabled(true);
             }
-        } catch (RuntimeException ignored) {
-        }
-    }
-
-    private void stopAudioCapture() {
-        recording = false;
-        AudioRecord record = audioRecord;
-        audioRecord = null;
-        if (record != null) {
-            try {
-                record.stop();
-            } catch (RuntimeException ignored) {
-            }
-            try {
-                record.release();
-            } catch (RuntimeException ignored) {
-            }
-        }
-        releaseAudioEffects();
-        Thread thread = audioThread;
-        audioThread = null;
-        if (thread != null) thread.interrupt();
+        } catch (RuntimeException ignored) { }
     }
 
     private void releaseAudioEffects() {
@@ -721,169 +684,17 @@ public final class GeminiLiveVoiceService extends Service {
         }
     }
 
-    private void handleSocketFailure(int ticket, String reason) {
-        if (ticket != generation || manualStop || !active) return;
-        setupComplete = false;
-        stopAudioCapture();
-        closeSocket();
-        broadcastStatus("Gemini Live دوبارہ جوڑ رہا ہوں",
-                cleanNetworkMessage(reason), false);
-        if (directMode && directRetryCount++ >= 2) {
-            broadcastStatus("فوری Live Voice نہیں جڑی",
-                    "Internet، API key یا Gemini quota چیک کریں", true);
-            main.postDelayed(() -> stopLive("Live connection دستیاب نہیں"), 2_300L);
-            return;
+    private void closeSocket() {
+        WebSocket current = socket;
+        socket = null;
+        if (current != null) {
+            try { current.cancel(); } catch (RuntimeException ignored) { }
         }
-        reconnectAttempt++;
-        long delay = Math.min(8_000L, 500L * (1L << Math.min(reconnectAttempt, 4)));
-        scheduleReconnect(delay);
-    }
-
-    private void scheduleReconnect(long delayMs) {
-        if (manualStop || !active) return;
-        if (reconnectRunnable != null) main.removeCallbacks(reconnectRunnable);
-        reconnectRunnable = this::connectNewSession;
-        main.postDelayed(reconnectRunnable, Math.max(250L, delayMs));
-    }
-
-    private void armDirectTimeout() {
-        removeDirectTimeout();
-        if (!directMode || manualStop || commandHandled) return;
-        directTimeoutRunnable = () -> {
-            if (!directMode || commandHandled || toolRunning || manualStop) return;
-            if (!currentTranscript.trim().isEmpty()) {
-                executeTranscriptFallback(currentTranscript);
-                return;
-            }
-            broadcastStatus("کمانڈ نہیں ملی",
-                    "35 سیکنڈ مکمل ہوئے؛ دوبارہ فوری Live Voice دبائیں", true);
-            main.postDelayed(() -> stopLive("فوری listening مکمل ہوئی"), 1_500L);
-        };
-        main.postDelayed(directTimeoutRunnable, DIRECT_LISTEN_TIMEOUT_MS);
-    }
-
-    private boolean hasNetwork() {
-        ConnectivityManager manager =
-                (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
-        if (manager == null) return true;
-        Network network = manager.getActiveNetwork();
-        if (network == null) return false;
-        NetworkCapabilities capabilities = manager.getNetworkCapabilities(network);
-        return capabilities != null && capabilities.hasCapability(
-                NetworkCapabilities.NET_CAPABILITY_INTERNET);
-    }
-
-    private void startAsForeground(boolean direct) {
-        Notification notification = buildNotification(direct
-                ? "فوری Gemini Live command"
-                : "کہیں: وزیر، پھر پوری کمانڈ");
-        if (Build.VERSION.SDK_INT >= 30) {
-            startForeground(NOTIFICATION_ID, notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE);
-        } else {
-            startForeground(NOTIFICATION_ID, notification);
-        }
-    }
-
-    private Notification buildNotification(String text) {
-        Intent open = new Intent(this, WazirGenZActivity.class)
-                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-        PendingIntent openPending = PendingIntent.getActivity(this, 20, open,
-                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-        Intent stop = new Intent(this, GeminiLiveVoiceService.class).setAction(ACTION_STOP);
-        PendingIntent stopPending = PendingIntent.getService(this, 21, stop,
-                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-        return new Notification.Builder(this, CHANNEL_ID)
-                .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-                .setContentTitle("وزیر Gen Z — Gemini Live")
-                .setContentText(text)
-                .setContentIntent(openPending)
-                .setOngoing(true)
-                .setOnlyAlertOnce(true)
-                .setCategory(Notification.CATEGORY_SERVICE)
-                .addAction(new Notification.Action.Builder(
-                        android.R.drawable.ic_media_pause, "بند کریں", stopPending).build())
-                .build();
-    }
-
-    private void createNotificationChannel() {
-        NotificationChannel channel = new NotificationChannel(
-                CHANNEL_ID, "Wazir Gemini Live voice", NotificationManager.IMPORTANCE_LOW);
-        channel.setDescription("وزیر کا مسلسل Gemini Live microphone اور phone control");
-        channel.setSound(null, null);
-        NotificationManager manager = getSystemService(NotificationManager.class);
-        if (manager != null) manager.createNotificationChannel(channel);
-    }
-
-    private void broadcastStatus(String status, String detail, boolean force) {
-        Intent intent = new Intent(ACTION_STATUS)
-                .setPackage(getPackageName())
-                .putExtra(EXTRA_STATUS, status == null ? "" : status)
-                .putExtra(EXTRA_DETAIL, detail == null ? "" : detail)
-                .putExtra(EXTRA_ENGINE, "Gemini Live • " + GeminiLiveProtocol.MODEL)
-                .putExtra(EXTRA_MODE, directMode ? "Direct Live" : "Hands-free Live");
-        sendBroadcast(intent);
-        NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
-        if (manager != null && active) manager.notify(NOTIFICATION_ID,
-                buildNotification(status == null ? "وزیر Live" : status));
-    }
-
-    private void broadcastTranscript(String transcript) {
-        sendBroadcast(new Intent(ACTION_TRANSCRIPT)
-                .setPackage(getPackageName())
-                .putExtra(EXTRA_TRANSCRIPT, transcript == null ? "" : transcript)
-                .putExtra(EXTRA_ENGINE, "Gemini Live • input transcription")
-                .putExtra(EXTRA_MODE, directMode ? "Direct Live" : "Hands-free Live"));
-    }
-
-    private void broadcastCommand(String command, String result, String mode, long latency) {
-        sendBroadcast(new Intent(ACTION_COMMAND)
-                .setPackage(getPackageName())
-                .putExtra(EXTRA_COMMAND, command == null ? "" : command)
-                .putExtra(EXTRA_RESULT, result == null ? "" : result)
-                .putExtra(EXTRA_ENGINE, "Gemini Live • " + GeminiLiveProtocol.MODEL)
-                .putExtra(EXTRA_MODE, mode == null ? "Gemini Live" : mode)
-                .putExtra(EXTRA_LATENCY_MS, latency));
     }
 
     private void setHandsFreeEnabled(boolean enabled) {
         SharedPreferences preferences = getSharedPreferences(PREFS, MODE_PRIVATE);
         preferences.edit().putBoolean(PREF_HANDS_FREE, enabled).apply();
-    }
-
-    private void stopLive(String message) {
-        active = false;
-        setupComplete = false;
-        setHandsFreeEnabled(false);
-        generation++;
-        removeAllCallbacks();
-        stopAudioCapture();
-        closeSocket();
-        releaseWakeLock();
-        if (audioPlayer != null) audioPlayer.stopNow();
-        if (message != null && !message.isEmpty()) {
-            broadcastCommand("", message, "Gemini Live", 0L);
-        }
-        stopForeground(true);
-        stopSelf();
-    }
-
-    private void closeSocket() {
-        WebSocket socket = webSocket;
-        webSocket = null;
-        if (socket != null) {
-            try {
-                socket.close(1000, "Wazir session restart");
-            } catch (RuntimeException ignored) {
-                try { socket.cancel(); } catch (RuntimeException ignoredAgain) { }
-            }
-        }
-    }
-
-    private String cleanNetworkMessage(String value) {
-        if (value == null || value.trim().isEmpty()) return "connection interrupted";
-        String safe = value.replaceAll("(?i)key=[^&\\s]+", "key=***").trim();
-        return safe.length() <= 180 ? safe : safe.substring(0, 180);
     }
 
     private void acquireWakeLock() {
@@ -894,8 +705,7 @@ public final class GeminiLiveVoiceService extends Service {
             if (wakeLockRenewal != null) main.removeCallbacks(wakeLockRenewal);
             wakeLockRenewal = this::acquireWakeLock;
             main.postDelayed(wakeLockRenewal, WAKE_LOCK_RENEW_MS);
-        } catch (RuntimeException ignored) {
-        }
+        } catch (RuntimeException ignored) { }
     }
 
     private void releaseWakeLock() {
@@ -906,14 +716,31 @@ public final class GeminiLiveVoiceService extends Service {
         }
     }
 
-    private void removeConnectWatchdog() {
-        if (connectWatchdog != null) main.removeCallbacks(connectWatchdog);
-        connectWatchdog = null;
+    private void stopLive(String message) {
+        active = false;
+        manualStop = true;
+        generation++;
+        clearSessionTimers();
+        stopAudioCapture();
+        closeSocket();
+        releaseWakeLock();
+        setHandsFreeEnabled(false);
+        stopForeground(true);
+        if (message != null && !message.trim().isEmpty()) {
+            broadcastCommand("", message.trim(), "Live", 0L);
+        }
+        stopSelf();
     }
 
-    private void removeFallback() {
-        if (fallbackRunnable != null) main.removeCallbacks(fallbackRunnable);
-        fallbackRunnable = null;
+    private String clean(String value) {
+        String safe = value == null ? "نامعلوم Live error" : value.trim();
+        if (safe.isEmpty()) safe = "نامعلوم Live error";
+        return safe.length() > 500 ? safe.substring(0, 500) : safe;
+    }
+
+    private void removeSetupWatchdog() {
+        if (setupWatchdog != null) main.removeCallbacks(setupWatchdog);
+        setupWatchdog = null;
     }
 
     private void removeDirectTimeout() {
@@ -921,30 +748,31 @@ public final class GeminiLiveVoiceService extends Service {
         directTimeoutRunnable = null;
     }
 
-    private void removeAllCallbacks() {
-        removeConnectWatchdog();
-        removeFallback();
+    private void removeTurnRunnable() {
+        if (turnRunnable != null) main.removeCallbacks(turnRunnable);
+        turnRunnable = null;
+    }
+
+    private void clearSessionTimers() {
+        removeSetupWatchdog();
         removeDirectTimeout();
+        removeTurnRunnable();
         if (reconnectRunnable != null) main.removeCallbacks(reconnectRunnable);
         reconnectRunnable = null;
     }
 
     @Override
     public void onDestroy() {
-        manualStop = true;
         active = false;
-        removeAllCallbacks();
+        manualStop = true;
+        generation++;
+        clearSessionTimers();
         stopAudioCapture();
         closeSocket();
         releaseWakeLock();
-        if (audioPlayer != null) {
-            audioPlayer.release();
-            audioPlayer = null;
-        }
-        if (httpClient != null) {
-            httpClient.dispatcher().executorService().shutdown();
-            httpClient.connectionPool().evictAll();
-            httpClient = null;
+        if (client != null) {
+            try { client.dispatcher().executorService().shutdownNow(); }
+            catch (RuntimeException ignored) { }
         }
         super.onDestroy();
     }
