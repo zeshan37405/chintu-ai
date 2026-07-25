@@ -12,7 +12,6 @@ public final class GeminiLiveProtocol {
             "gemini-2.5-flash-native-audio-preview-12-2025"
     };
     public static final int INPUT_SAMPLE_RATE = 16_000;
-    public static final int OUTPUT_SAMPLE_RATE = 24_000;
 
     private GeminiLiveProtocol() {
     }
@@ -29,16 +28,16 @@ public final class GeminiLiveProtocol {
     }
 
     /**
-     * Keep the first handshake deliberately minimal. The 5.0 Redmi recording showed that the
-     * socket opened but setupComplete never arrived. Live is now used only for continuous audio
-     * transcription; the complete transcript is planned and executed by the existing Gemini REST
-     * brain after turnComplete. This removes the large function schema and optional preview fields
-     * from the critical connection handshake.
+     * Minimal cross-version handshake. Live only transcribes the microphone; the existing Gemini
+     * REST brain plans and executes Android actions after turnComplete. Removing the large function
+     * schema and optional compression/resumption fields makes setup failures observable and avoids
+     * the 5.0 state where the WebSocket opened but setupComplete never arrived.
      */
     public static String setupMessage(boolean directMode, String model) throws JSONException {
         JSONObject setup = new JSONObject();
         setup.put("model", "models/" + model);
-        setup.put("responseModalities", new JSONArray().put("AUDIO"));
+        setup.put("generationConfig", new JSONObject()
+                .put("responseModalities", new JSONArray().put("AUDIO")));
         setup.put("systemInstruction", new JSONObject()
                 .put("parts", new JSONArray().put(new JSONObject().put("text",
                         systemInstruction(directMode)))));
@@ -91,8 +90,8 @@ public final class GeminiLiveProtocol {
                 : "This is hands-free mode. Ignore speech that does not begin with the wake word وزیر, وزیر جی, Wazir, Wazeer or Vazir.";
         return "You are Wazir, Zeeshan's Urdu-first Android voice assistant. "
                 + mode + " Listen to the entire sentence and tolerate natural pauses. "
-                + "Do not act and do not call tools in this Live session. The Android app will use the input transcription "
-                + "after the user's turn ends. Give at most a very short Urdu acknowledgement so turnComplete is emitted. "
-                + "Never repeat the full command and never ask for PIN, password, OTP or payment information.";
+                + "Do not call tools in this Live session. The Android app will use the input transcription after the user's turn ends. "
+                + "Give at most one very short Urdu acknowledgement so turnComplete is emitted. Never repeat the full command. "
+                + "Never ask for PIN, password, OTP or payment information.";
     }
 }
