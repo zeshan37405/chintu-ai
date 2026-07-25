@@ -7,17 +7,20 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.ResultReceiver;
 
+import org.json.JSONObject;
+
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Executes recognized commands in the main process through Gemini structured planning first,
- * with Wazir's existing local parser as an explicit fallback.
+ * Executes voice commands in the main application process where the Accessibility service lives.
+ * Gemini Live can send an already structured plan; text-only callers still use WazirAiBrain.
  */
 public final class CommandExecutionReceiver extends BroadcastReceiver {
     public static final String ACTION_EXECUTE =
             "com.zeshan.chintuai.action.EXECUTE_RECOGNIZED_COMMAND";
     public static final String EXTRA_COMMAND = "command";
+    public static final String EXTRA_PLAN_JSON = "plan_json";
     public static final String EXTRA_REPLY = "reply";
     public static final String RESULT_HANDLED = "handled";
     public static final String RESULT_MESSAGE = "message";
@@ -33,6 +36,7 @@ public final class CommandExecutionReceiver extends BroadcastReceiver {
         if (intent == null || !ACTION_EXECUTE.equals(intent.getAction())) return;
 
         String command = intent.getStringExtra(EXTRA_COMMAND);
+        String planJson = intent.getStringExtra(EXTRA_PLAN_JSON);
         ResultReceiver reply = readReply(intent);
         PendingResult pending = goAsync();
         Context appContext = context.getApplicationContext();
@@ -40,9 +44,19 @@ public final class CommandExecutionReceiver extends BroadcastReceiver {
         EXECUTOR.execute(() -> {
             WazirAiBrain.Execution execution;
             try {
-                execution = WazirAiBrain.execute(appContext,
-                        command == null ? "" : command.trim());
-            } catch (RuntimeException error) {
+                String safeCommand = command == null ? "" : command.trim();
+                if (planJson != null && !planJson.trim().isEmpty()) {
+                    GeminiActionPlan plan = GeminiActionPlan.fromFunctionArgs(
+                            new JSONObject(planJson));
+                    BackgroundCommandExecutor.Result result =
+                            StructuredActionExecutor.execute(appContext, safeCommand, plan);
+                    execution = new WazirAiBrain.Execution(
+                            result, true, "Gemini Live " + GeminiLiveProtocol.MODEL,
+                            "live structured actions: " + plan.actions.size());
+                } else {
+                    execution = WazirAiBrain.execute(appContext, safeCommand);
+                }
+            } catch (Exception error) {
                 execution = new WazirAiBrain.Execution(
                         new BackgroundCommandExecutor.Result(
                                 false, "کمانڈ مکمل نہیں ہوئی، دوبارہ کوشش کریں", false),

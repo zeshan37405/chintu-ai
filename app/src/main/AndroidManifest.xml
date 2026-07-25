@@ -58,12 +58,6 @@
             <category android:name="android.intent.category.LAUNCHER" />
         </intent>
         <intent>
-            <action android:name="android.speech.RecognitionService" />
-        </intent>
-        <intent>
-            <action android:name="android.speech.action.RECOGNIZE_SPEECH" />
-        </intent>
-        <intent>
             <action android:name="android.media.action.STILL_IMAGE_CAMERA" />
         </intent>
         <intent>
@@ -141,11 +135,19 @@
             android:exported="false" />
 
         <service
+            android:name=".GeminiLiveVoiceService"
+            android:exported="false"
+            android:foregroundServiceType="microphone"
+            android:process=":live_voice"
+            android:stopWithTask="false" />
+
+        <service
             android:name=".WazirVoiceService"
+            android:enabled="false"
             android:exported="false"
             android:foregroundServiceType="microphone"
             android:process=":voice"
-            android:stopWithTask="false" />
+            android:stopWithTask="true" />
 
         <service
             android:name=".HandsFreeVoiceService"
