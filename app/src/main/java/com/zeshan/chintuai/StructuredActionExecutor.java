@@ -6,9 +6,10 @@ import android.os.SystemClock;
 import java.util.ArrayList;
 import java.util.List;
 
-/** Validates and executes Gemini-planned actions through Wazir's existing Android safety layer. */
+/** Validates and executes Gemini-planned actions through Wazir's Android safety layer. */
 public final class StructuredActionExecutor {
     private static final int MAX_ACTIONS = 6;
+    private static final long APP_WINDOW_TIMEOUT_MS = 6_000L;
 
     private StructuredActionExecutor() {
     }
@@ -36,6 +37,7 @@ public final class StructuredActionExecutor {
             }
             if (action.delayMs > 0L) SystemClock.sleep(action.delayMs);
 
+            long windowBaseline = ChintuAccessibilityService.getLastWindowEventAt();
             BackgroundCommandExecutor.Result result = executeOne(context, originalCommand, action);
             if (result == null) continue;
             if (!result.message.isEmpty()) results.add(result.message);
@@ -48,8 +50,7 @@ public final class StructuredActionExecutor {
             }
 
             if (action.type == GeminiActionPlan.Type.OPEN_APP && result.handled) {
-                // Give Android and the target app enough time to expose its Accessibility tree.
-                SystemClock.sleep(1_350L);
+                waitForExternalWindow(context, windowBaseline, APP_WINDOW_TIMEOUT_MS);
             }
         }
 
@@ -68,20 +69,17 @@ public final class StructuredActionExecutor {
                 if (action.target.isEmpty()) return fail("ایپ کا نام موجود نہیں");
                 return BackgroundCommandExecutor.execute(context, action.target + " کھولو");
             case SCROLL:
-                return BackgroundCommandExecutor.execute(context,
-                        "up".equals(action.direction) || "اوپر".equals(action.direction)
-                                ? "اوپر سکرول کرو" : "نیچے سکرول کرو");
+                return repeatedScroll("up".equals(action.direction)
+                        || "اوپر".equals(action.direction));
             case SWIPE:
-                if ("left".equals(action.direction) || "بائیں".equals(action.direction)) {
-                    return BackgroundCommandExecutor.execute(context, "بائیں سوائپ کرو");
-                }
-                return BackgroundCommandExecutor.execute(context, "دائیں سوائپ کرو");
+                return repeatedSwipe("left".equals(action.direction)
+                        || "بائیں".equals(action.direction));
             case TYPE_TEXT:
                 if (action.text.isEmpty()) return fail("ٹائپ کرنے کا متن موجود نہیں");
                 return BackgroundCommandExecutor.execute(context, "ٹائپ کرو " + action.text);
             case CLICK_TEXT:
                 if (action.target.isEmpty()) return fail("کلک کرنے کا بٹن موجود نہیں");
-                return BackgroundCommandExecutor.execute(context, "کلک کرو " + action.target);
+                return retryVisibleClick(action.target);
             case BACK:
                 return BackgroundCommandExecutor.execute(context, "واپس جاؤ");
             case HOME:
@@ -126,6 +124,64 @@ public final class StructuredActionExecutor {
             default:
                 return fail("یہ structured action دستیاب نہیں");
         }
+    }
+
+    private static BackgroundCommandExecutor.Result repeatedScroll(boolean up) {
+        if (!ChintuAccessibilityService.isConnected()) {
+            return fail("سکرول کے لیے Wazir phone control Accessibility آن کریں");
+        }
+        boolean accepted = false;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            boolean value = up
+                    ? ChintuAccessibilityService.scrollUp()
+                    : ChintuAccessibilityService.scrollDown();
+            accepted |= value;
+            if (attempt < 2) SystemClock.sleep(attempt == 0 ? 800L : 650L);
+        }
+        if (!accepted) return fail(up ? "اوپر سکرول نہیں ہوا" : "نیچے سکرول نہیں ہوا");
+        return BackgroundCommandExecutor.Result.ok(
+                up ? "اوپر سکرول کر دیا ہے" : "نیچے سکرول کر دیا ہے");
+    }
+
+    private static BackgroundCommandExecutor.Result repeatedSwipe(boolean left) {
+        if (!ChintuAccessibilityService.isConnected()) {
+            return fail("سوائپ کے لیے Wazir phone control Accessibility آن کریں");
+        }
+        boolean accepted = left
+                ? ChintuAccessibilityService.swipeLeft()
+                : ChintuAccessibilityService.swipeRight();
+        if (!accepted) return fail(left ? "بائیں سوائپ نہیں ہوا" : "دائیں سوائپ نہیں ہوا");
+        return BackgroundCommandExecutor.Result.ok(
+                left ? "بائیں سوائپ کر دیا ہے" : "دائیں سوائپ کر دیا ہے");
+    }
+
+    private static BackgroundCommandExecutor.Result retryVisibleClick(String target) {
+        if (!ChintuAccessibilityService.isConnected()) {
+            return fail("کلک کے لیے Wazir phone control Accessibility آن کریں");
+        }
+        for (int attempt = 0; attempt < 4; attempt++) {
+            if (ChintuAccessibilityService.clickByVisibleText(target)) {
+                return BackgroundCommandExecutor.Result.ok(target + " دبا دیا ہے");
+            }
+            SystemClock.sleep(450L + attempt * 200L);
+        }
+        return fail(target + " اسکرین پر نہیں ملا");
+    }
+
+    private static void waitForExternalWindow(Context context, long baseline, long timeoutMs) {
+        long deadline = SystemClock.uptimeMillis() + timeoutMs;
+        String ownPackage = context.getPackageName();
+        while (SystemClock.uptimeMillis() < deadline) {
+            String packageName = ChintuAccessibilityService.getActivePackageName();
+            long eventAt = ChintuAccessibilityService.getLastWindowEventAt();
+            if (!packageName.isEmpty() && !ownPackage.equals(packageName) && eventAt > baseline) {
+                SystemClock.sleep(700L);
+                return;
+            }
+            SystemClock.sleep(160L);
+        }
+        // The target app may hide package/window events. Still allow a conservative settle period.
+        SystemClock.sleep(500L);
     }
 
     private static BackgroundCommandExecutor.Result fail(String message) {
