@@ -1,0 +1,36 @@
+package com.zeshan.chintuai;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+import org.junit.Test;
+
+public final class GeminiLiveProtocolTest {
+    @Test
+    public void responseModalitiesLivesInsideGenerationConfig() throws Exception {
+        JSONObject root = new JSONObject(GeminiLiveProtocol.setupMessage(
+                true, "gemini-3.1-flash-live-preview"));
+        JSONObject setup = root.getJSONObject("setup");
+
+        assertFalse(setup.has("responseModalities"));
+        JSONObject generation = setup.getJSONObject("generationConfig");
+        JSONArray modalities = generation.getJSONArray("responseModalities");
+        assertEquals(1, modalities.length());
+        assertEquals("AUDIO", modalities.getString(0));
+    }
+
+    @Test
+    public void setupStillIncludesTranscriptionAndVad() throws Exception {
+        JSONObject root = new JSONObject(GeminiLiveProtocol.setupMessage(
+                false, "gemini-2.5-flash-native-audio-preview-12-2025"));
+        JSONObject setup = root.getJSONObject("setup");
+
+        assertEquals("models/gemini-2.5-flash-native-audio-preview-12-2025",
+                setup.getString("model"));
+        assertTrue(setup.has("inputAudioTranscription"));
+        assertTrue(setup.has("realtimeInputConfig"));
+    }
+}
