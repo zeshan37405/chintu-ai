@@ -3,7 +3,7 @@ name: Build Android APK
 on:
   workflow_dispatch:
   push:
-    branches: ["main", "feature/wazir-gen-z-4.1-gemini-brain"]
+    branches: ["main"]
   pull_request:
     branches: ["main"]
 
