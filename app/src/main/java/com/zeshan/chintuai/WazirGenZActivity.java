@@ -18,12 +18,11 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.provider.Settings;
-import android.speech.RecognizerIntent;
+import android.text.InputType;
 import android.view.Gravity;
 import android.view.ViewGroup;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
-import android.text.InputType;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
@@ -36,11 +35,10 @@ import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-/** Wazir Gen Z 4.1 command center: one-shot voice transcript + Gemini structured actions. */
+/** Wazir Gen Z 5.0 command center powered by a persistent Gemini Live PCM stream. */
 @SuppressLint("UnspecifiedRegisterReceiverFlag")
 public final class WazirGenZActivity extends Activity {
     private static final int REQUEST_PERMISSIONS = 8101;
-    private static final int REQUEST_ONE_SHOT_VOICE = 8102;
 
     private static final int TOP = Color.rgb(2, 10, 20);
     private static final int BOTTOM = Color.rgb(8, 30, 46);
@@ -63,30 +61,57 @@ public final class WazirGenZActivity extends Activity {
     private TextView accessibilityView;
     private EditText commandInput;
     private Button handsFreeButton;
+    private Button directVoiceButton;
     private boolean receiverRegistered;
-    private boolean serviceReportedRunning;
+    private boolean liveSessionRunning;
+    private boolean directSession;
 
     private final BroadcastReceiver receiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
             if (intent == null) return;
             String action = intent.getAction();
-            String engine = intent.getStringExtra(WazirVoiceService.EXTRA_ENGINE);
+            String engine = intent.getStringExtra(GeminiLiveVoiceService.EXTRA_ENGINE);
+            String mode = intent.getStringExtra(GeminiLiveVoiceService.EXTRA_MODE);
             if (engine != null && !engine.trim().isEmpty()) engineView.setText(engine);
+            if (mode != null && !mode.trim().isEmpty()) {
+                aiView.setText("AI/Voice: " + mode);
+                directSession = mode.contains("Direct");
+            }
 
-            if (WazirVoiceService.ACTION_STATUS.equals(action)) {
-                serviceReportedRunning = true;
-                setStatus(intent.getStringExtra(WazirVoiceService.EXTRA_STATUS),
-                        intent.getStringExtra(WazirVoiceService.EXTRA_DETAIL), CYAN);
-                updateHandsFreeButton();
-            } else if (WazirVoiceService.ACTION_COMMAND.equals(action)) {
-                String command = intent.getStringExtra(WazirVoiceService.EXTRA_COMMAND);
-                String result = intent.getStringExtra(WazirVoiceService.EXTRA_RESULT);
-                long latency = intent.getLongExtra(WazirVoiceService.EXTRA_LATENCY_MS, -1L);
-                if (command != null && !command.trim().isEmpty()) commandInput.setText(command);
-                if (latency >= 0L) latencyView.setText("Voice → action: " + latency + " ms");
-                if (result != null && !result.trim().isEmpty()) setStatus("مکمل", result, GREEN);
-                updateHandsFreeButton();
+            if (GeminiLiveVoiceService.ACTION_STATUS.equals(action)) {
+                liveSessionRunning = true;
+                setStatus(intent.getStringExtra(GeminiLiveVoiceService.EXTRA_STATUS),
+                        intent.getStringExtra(GeminiLiveVoiceService.EXTRA_DETAIL), CYAN);
+                updateVoiceButtons();
+                return;
+            }
+            if (GeminiLiveVoiceService.ACTION_TRANSCRIPT.equals(action)) {
+                String transcript = intent.getStringExtra(
+                        GeminiLiveVoiceService.EXTRA_TRANSCRIPT);
+                if (transcript != null && !transcript.trim().isEmpty()) {
+                    commandInput.setText(transcript);
+                    commandInput.setSelection(commandInput.length());
+                    setStatus("Live transcript", transcript, CYAN);
+                }
+                return;
+            }
+            if (GeminiLiveVoiceService.ACTION_COMMAND.equals(action)) {
+                String command = intent.getStringExtra(GeminiLiveVoiceService.EXTRA_COMMAND);
+                String result = intent.getStringExtra(GeminiLiveVoiceService.EXTRA_RESULT);
+                long latency = intent.getLongExtra(
+                        GeminiLiveVoiceService.EXTRA_LATENCY_MS, -1L);
+                if (command != null && !command.trim().isEmpty()) {
+                    commandInput.setText(command);
+                    commandInput.setSelection(commandInput.length());
+                }
+                if (latency >= 0L) latencyView.setText(
+                        "Live voice → action: " + latency + " ms");
+                if (result != null && !result.trim().isEmpty()) {
+                    setStatus("مکمل", result, GREEN);
+                }
+                if (directSession) liveSessionRunning = false;
+                updateVoiceButtons();
             }
         }
     };
@@ -100,14 +125,14 @@ public final class WazirGenZActivity extends Activity {
         registerVoiceReceiver();
         updateAiState();
         setStatus("وزیر تیار ہے",
-                "فوری وائس بٹن الگ one-shot transcript لیتا ہے؛ ہینڈز فری آن نہیں کرتا",
+                "Gemini Live مسلسل آڈیو stream استعمال کرتا ہے؛ Google کا دو سیکنڈ والا dialog ختم ہے",
                 GREEN);
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        updateHandsFreeButton();
+        updateVoiceButtons();
         updateAccessibilityState();
         updateAiState();
     }
@@ -135,10 +160,10 @@ public final class WazirGenZActivity extends Activity {
         header.addView(titles, new LinearLayout.LayoutParams(
                 0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         titles.addView(text("وزیر", 42, TEXT, true), matchWrap());
-        titles.addView(text("GEN Z • VOICE TRANSCRIPT • GEMINI BRAIN",
+        titles.addView(text("GEN Z • GEMINI LIVE • PHONE CONTROL",
                 12, MUTED, false), matchWrap());
 
-        TextView badge = text("GEN Z\n" + BuildConfig.VERSION_NAME, 11, TEXT, true);
+        TextView badge = text("LIVE\n" + BuildConfig.VERSION_NAME, 11, TEXT, true);
         badge.setGravity(Gravity.CENTER);
         badge.setPadding(dp(12), dp(8), dp(12), dp(8));
         badge.setBackground(rounded(CARD_LIGHT, dp(18), CYAN));
@@ -148,8 +173,7 @@ public final class WazirGenZActivity extends Activity {
         LinearLayout.LayoutParams coreParams = matchWrap();
         coreParams.topMargin = dp(18);
         root.addView(core, coreParams);
-
-        TextView coreTitle = text("WAZIR AI CORE", 13, CYAN, true);
+        TextView coreTitle = text("WAZIR LIVE VOICE CORE", 13, CYAN, true);
         coreTitle.setGravity(Gravity.CENTER);
         core.addView(coreTitle, matchWrap());
         TextView orb = text("◉", 82, CYAN, false);
@@ -160,51 +184,48 @@ public final class WazirGenZActivity extends Activity {
         statusView = text("وزیر تیار ہے", 23, GREEN, true);
         statusView.setGravity(Gravity.CENTER);
         core.addView(statusView, matchWrap());
-        detailView = text("فوری وائس یا تحریری کمانڈ دیں", 17, TEXT, false);
+        detailView = text("کہیں: وزیر، پھر پوری کمانڈ", 17, TEXT, false);
         detailView.setGravity(Gravity.CENTER);
-        detailView.setMinHeight(dp(66));
+        detailView.setMinHeight(dp(78));
         detailView.setPadding(dp(4), dp(10), dp(4), dp(8));
         core.addView(detailView, matchWrap());
 
-        LinearLayout telemetry = new LinearLayout(this);
-        telemetry.setOrientation(LinearLayout.VERTICAL);
-        core.addView(telemetry, matchWrap());
-        engineView = chip("Voice engine: waiting");
-        telemetry.addView(engineView, matchWrap());
+        engineView = chip("Voice: Gemini Live 3.1");
+        core.addView(engineView, matchWrap());
         aiView = chip("AI: checking Gemini key");
-        telemetry.addView(aiView, matchWrap());
-        latencyView = chip("Voice/AI → action: —");
-        telemetry.addView(latencyView, matchWrap());
+        core.addView(aiView, matchWrap());
+        latencyView = chip("Live voice → action: —");
+        core.addView(latencyView, matchWrap());
 
-        handsFreeButton = primaryButton("🎙  وزیر ہینڈز فری آن کریں");
+        handsFreeButton = primaryButton("🎙  وزیر Live ہینڈز فری آن کریں");
         handsFreeButton.setOnClickListener(v -> toggleHandsFree());
         LinearLayout.LayoutParams handsParams = matchWrap();
-        handsParams.height = dp(62);
+        handsParams.height = dp(64);
         handsParams.topMargin = dp(14);
         root.addView(handsFreeButton, handsParams);
 
-        Button oneShot = primaryButton("⚡ فوری وائس → Gemini کمانڈ");
-        oneShot.setOnClickListener(v -> launchOneShotVoice());
-        LinearLayout.LayoutParams oneShotParams = matchWrap();
-        oneShotParams.height = dp(60);
-        oneShotParams.topMargin = dp(10);
-        root.addView(oneShot, oneShotParams);
+        directVoiceButton = primaryButton("⚡ فوری Gemini Live — 35 سیکنڈ");
+        directVoiceButton.setOnClickListener(v -> startDirectVoice());
+        LinearLayout.LayoutParams directParams = matchWrap();
+        directParams.height = dp(62);
+        directParams.topMargin = dp(10);
+        root.addView(directVoiceButton, directParams);
 
-        TextView oneShotNote = text(
-                "یہ بٹن ہینڈز فری سروس شروع نہیں کرتا۔ Android کا one-shot voice recognizer "
-                        + "عبارت واپس دے گا، پھر Gemini اسے structured actions میں بدلے گا۔",
+        TextView directNote = text(
+                "یہ بٹن Google voice dialog نہیں کھولتا۔ وزیر کے اندر ہی microphone stream شروع ہوتی ہے، "
+                        + "پوری عبارت live لکھی جاتی ہے اور Gemini structured actions چلاتا ہے۔",
                 13, MUTED, false);
-        oneShotNote.setPadding(dp(6), dp(10), dp(6), 0);
-        root.addView(oneShotNote, matchWrap());
+        directNote.setPadding(dp(6), dp(10), dp(6), 0);
+        root.addView(directNote, matchWrap());
 
         LinearLayout aiCard = card();
         LinearLayout.LayoutParams aiParams = matchWrap();
         aiParams.topMargin = dp(14);
         root.addView(aiCard, aiParams);
-        aiCard.addView(text("GEMINI AI BRAIN", 15, CYAN, true), matchWrap());
+        aiCard.addView(text("GEMINI LIVE CONNECTION", 15, CYAN, true), matchWrap());
         TextView aiExplanation = text(
-                "Google Notes میں محفوظ Gemini key یہاں ایک بار paste کریں۔ Key GitHub یا APK "
-                        + "میں شامل نہیں ہوگی؛ فون کے Android Keystore سے encrypt ہوگی۔",
+                "Google Notes میں محفوظ Gemini API key یہاں ایک بار paste کریں۔ Key APK یا GitHub "
+                        + "میں شامل نہیں ہوگی اور Android Keystore سے encrypted رہے گی۔",
                 13, MUTED, false);
         aiExplanation.setPadding(0, dp(7), 0, dp(6));
         aiCard.addView(aiExplanation, matchWrap());
@@ -219,12 +240,12 @@ public final class WazirGenZActivity extends Activity {
         commandCard.addView(text("تحریری Gemini کمانڈ", 15, CYAN, true), matchWrap());
 
         commandInput = new EditText(this);
-        commandInput.setHint("مثلاً: فیس بک کھولو، پوسٹ لکھو مگر شائع نہ کرنا");
+        commandInput.setHint("مثلاً: فیس بک کھولو اور تین بار نیچے سکرول کرو");
         commandInput.setHintTextColor(MUTED);
         commandInput.setTextColor(TEXT);
         commandInput.setTextSize(17);
         commandInput.setGravity(Gravity.RIGHT | Gravity.CENTER_VERTICAL);
-        commandInput.setMaxLines(4);
+        commandInput.setMaxLines(5);
         commandInput.setImeOptions(EditorInfo.IME_ACTION_GO);
         commandInput.setPadding(dp(12), dp(12), dp(12), dp(12));
         commandInput.setBackground(rounded(TOP, dp(15), CARD_LIGHT));
@@ -264,7 +285,7 @@ public final class WazirGenZActivity extends Activity {
 
         TextView safety = text(
                 "حفاظت: رقم کی منتقلی، خریداری، PIN، OTP، پاس ورڈ اور حساس اکاؤنٹ تبدیلیاں "
-                        + "AI plan میں بھی بند ہیں۔ Post/Send/Publish الگ تصدیق مانگیں گے۔",
+                        + "بند ہیں۔ Post/Send/Publish الگ تصدیق مانگیں گے۔",
                 13, MUTED, false);
         safety.setPadding(dp(5), dp(16), dp(5), 0);
         root.addView(safety, matchWrap());
@@ -272,63 +293,61 @@ public final class WazirGenZActivity extends Activity {
     }
 
     private void toggleHandsFree() {
-        if (WazirVoiceService.isEnabled(this) || serviceReportedRunning) {
-            startService(new Intent(this, WazirVoiceService.class)
-                    .setAction(WazirVoiceService.ACTION_STOP));
-            serviceReportedRunning = false;
-            setStatus("بند کر رہا ہوں", "وزیر کا مسلسل مائیک بند ہو رہا ہے", AMBER);
-            updateHandsFreeButton();
+        boolean enabled = GeminiLiveVoiceService.isEnabled(this) ||
+                (liveSessionRunning && !directSession);
+        if (enabled) {
+            startService(new Intent(this, GeminiLiveVoiceService.class)
+                    .setAction(GeminiLiveVoiceService.ACTION_STOP));
+            liveSessionRunning = false;
+            directSession = false;
+            setStatus("بند کر رہا ہوں", "Gemini Live microphone بند ہو رہا ہے", AMBER);
+            updateVoiceButtons();
             return;
         }
-        if (!hasMicPermission()) {
-            requestCorePermissions();
-            return;
-        }
-        startVoiceService(WazirVoiceService.ACTION_START);
+        if (!canStartLiveVoice()) return;
+        directSession = false;
+        liveSessionRunning = true;
+        startLiveService(GeminiLiveVoiceService.ACTION_START_HANDS_FREE);
+        setStatus("وزیر Live شروع ہو رہا ہے",
+                "Connection مکمل ہونے کے بعد کہیں: وزیر، پھر پوری کمانڈ", CYAN);
+        updateVoiceButtons();
     }
 
-    private void launchOneShotVoice() {
+    private void startDirectVoice() {
+        if (!canStartLiveVoice()) return;
+        directSession = true;
+        liveSessionRunning = true;
+        startLiveService(GeminiLiveVoiceService.ACTION_START_DIRECT);
+        setStatus("فوری Gemini Live شروع ہو رہا ہے",
+                "Connection کے بعد پوری کمانڈ بولیں؛ دو سیکنڈ کی حد نہیں ہے", CYAN);
+        updateVoiceButtons();
+    }
+
+    private boolean canStartLiveVoice() {
         if (!hasMicPermission()) {
             requestCorePermissions();
-            return;
+            return false;
         }
-        Intent voice = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
-                .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,
-                        RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ur-PK")
-                .putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "ur-PK")
-                .putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 8)
-                .putExtra(RecognizerIntent.EXTRA_PROMPT,
-                        "وزیر کے لیے پوری کمانڈ بولیں");
+        if (!WazirSecretStore.hasGeminiApiKey(this)) {
+            setStatus("Gemini key درکار ہے",
+                    "پہلے Gemini API key محفوظ کریں", AMBER);
+            showGeminiKeyDialog();
+            return false;
+        }
+        return true;
+    }
+
+    private void startLiveService(String action) {
+        Intent start = new Intent(this, GeminiLiveVoiceService.class).setAction(action);
         try {
-            setStatus("فوری وائس سن رہا ہے",
-                    "یہ one-shot mode ہے؛ ہینڈز فری آن نہیں ہوگا", CYAN);
-            startActivityForResult(voice, REQUEST_ONE_SHOT_VOICE);
-        } catch (ActivityNotFoundException error) {
-            setStatus("Voice recognizer دستیاب نہیں",
-                    "Google Speech Services اپڈیٹ یا فعال کریں", AMBER);
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(start);
+            else startService(start);
+        } catch (RuntimeException error) {
+            liveSessionRunning = false;
+            setStatus("Gemini Live شروع نہیں ہوئی",
+                    "Microphone، Notifications، Internet اور API key چیک کریں", AMBER);
+            updateVoiceButtons();
         }
-    }
-
-    @Override
-    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-        super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode != REQUEST_ONE_SHOT_VOICE) return;
-        if (resultCode != RESULT_OK || data == null) {
-            setStatus("فوری وائس منسوخ ہوئی",
-                    "دوبارہ بٹن دبائیں اور پوری کمانڈ بولیں", AMBER);
-            return;
-        }
-        ArrayList<String> matches =
-                data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS);
-        String transcript = CommandEngine.chooseBest(matches);
-        if (transcript.isEmpty()) {
-            setStatus("عبارت نہیں ملی", "دوبارہ واضح کمانڈ بولیں", AMBER);
-            return;
-        }
-        commandInput.setText(transcript);
-        setStatus("Voice transcript مل گیا", transcript, CYAN);
-        runAiCommand(transcript, "Voice");
     }
 
     private void runTypedCommand() {
@@ -338,10 +357,6 @@ public final class WazirGenZActivity extends Activity {
             return;
         }
         hideKeyboard();
-        runAiCommand(command, "Typed");
-    }
-
-    private void runAiCommand(String command, String source) {
         setStatus("Gemini سمجھ رہا ہے", command, CYAN);
         aiView.setText("AI: planning structured actions…");
         long started = android.os.SystemClock.uptimeMillis();
@@ -351,7 +366,7 @@ public final class WazirGenZActivity extends Activity {
             long latency = android.os.SystemClock.uptimeMillis() - started;
             runOnUiThread(() -> {
                 aiView.setText("AI: " + execution.mode);
-                latencyView.setText(source + "/AI → action: " + latency + " ms");
+                latencyView.setText("Typed/AI → action: " + latency + " ms");
                 setStatus(execution.result.handled ? "مکمل" : "کمانڈ مکمل نہیں ہوئی",
                         execution.result.message,
                         execution.result.handled ? GREEN : AMBER);
@@ -381,7 +396,7 @@ public final class WazirGenZActivity extends Activity {
         container.addView(input, inputParams);
 
         new AlertDialog.Builder(this)
-                .setTitle("Gemini AI Brain")
+                .setTitle("Gemini Live Voice")
                 .setView(container)
                 .setPositiveButton("محفوظ کریں", (dialog, which) -> {
                     boolean saved = WazirSecretStore.saveGeminiApiKey(
@@ -404,26 +419,11 @@ public final class WazirGenZActivity extends Activity {
     private void updateAiState() {
         if (aiView == null) return;
         if (WazirSecretStore.hasGeminiApiKey(this)) {
-            aiView.setText("AI: Gemini 2.5 Flash • key encrypted");
+            aiView.setText("AI: Gemini Live 3.1 • key encrypted");
             aiView.setTextColor(GREEN);
         } else {
-            aiView.setText("AI: Gemini key درکار • ابھی local rules");
+            aiView.setText("AI: Gemini key درکار");
             aiView.setTextColor(AMBER);
-        }
-    }
-
-    private void startVoiceService(String action) {
-        Intent start = new Intent(this, WazirVoiceService.class).setAction(action);
-        try {
-            if (Build.VERSION.SDK_INT >= 26) startForegroundService(start);
-            else startService(start);
-            serviceReportedRunning = true;
-            setStatus("وزیر ہینڈز فری شروع ہو رہا ہے",
-                    "مسلسل wake word mode؛ فوری وائس بٹن اس سے الگ ہے", CYAN);
-            updateHandsFreeButton();
-        } catch (RuntimeException error) {
-            setStatus("ہینڈز فری شروع نہیں ہوئی",
-                    "Microphone اور Notifications اجازت چیک کریں", AMBER);
         }
     }
 
@@ -438,7 +438,9 @@ public final class WazirGenZActivity extends Activity {
         addIfMissing(missing, Manifest.permission.READ_CONTACTS);
         addIfMissing(missing, Manifest.permission.CALL_PHONE);
         addIfMissing(missing, Manifest.permission.CAMERA);
-        if (Build.VERSION.SDK_INT >= 33) addIfMissing(missing, Manifest.permission.POST_NOTIFICATIONS);
+        if (Build.VERSION.SDK_INT >= 33) {
+            addIfMissing(missing, Manifest.permission.POST_NOTIFICATIONS);
+        }
         if (missing.isEmpty()) {
             Toast.makeText(this, "ضروری اجازتیں موجود ہیں", Toast.LENGTH_SHORT).show();
             return;
@@ -467,22 +469,41 @@ public final class WazirGenZActivity extends Activity {
     private void registerVoiceReceiver() {
         if (receiverRegistered) return;
         IntentFilter filter = new IntentFilter();
-        filter.addAction(WazirVoiceService.ACTION_STATUS);
-        filter.addAction(WazirVoiceService.ACTION_COMMAND);
-        if (Build.VERSION.SDK_INT >= 33) registerReceiver(receiver, filter, RECEIVER_NOT_EXPORTED);
-        else registerReceiver(receiver, filter);
+        filter.addAction(GeminiLiveVoiceService.ACTION_STATUS);
+        filter.addAction(GeminiLiveVoiceService.ACTION_TRANSCRIPT);
+        filter.addAction(GeminiLiveVoiceService.ACTION_COMMAND);
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(receiver, filter, RECEIVER_NOT_EXPORTED);
+        } else {
+            registerReceiver(receiver, filter);
+        }
         receiverRegistered = true;
     }
 
-    private void updateHandsFreeButton() {
-        if (handsFreeButton == null) return;
-        boolean enabled = serviceReportedRunning || WazirVoiceService.isEnabled(this);
-        handsFreeButton.setText(enabled
-                ? "■  وزیر ہینڈز فری بند کریں"
-                : "🎙  وزیر ہینڈز فری آن کریں");
+    private void updateVoiceButtons() {
+        if (handsFreeButton == null || directVoiceButton == null) return;
+        boolean handsFree = GeminiLiveVoiceService.isEnabled(this)
+                || (liveSessionRunning && !directSession);
+        handsFreeButton.setText(handsFree
+                ? "■  وزیر Live ہینڈز فری بند کریں"
+                : "🎙  وزیر Live ہینڈز فری آن کریں");
         handsFreeButton.setBackground(rounded(
-                enabled ? Color.rgb(146, 52, 67) : Color.rgb(25, 137, 181),
-                dp(22), enabled ? RED : CYAN));
+                handsFree ? Color.rgb(146, 52, 67) : Color.rgb(25, 137, 181),
+                dp(22), handsFree ? RED : CYAN));
+        directVoiceButton.setText(liveSessionRunning && directSession
+                ? "■  فوری Gemini Live بند کریں"
+                : "⚡ فوری Gemini Live — 35 سیکنڈ");
+        directVoiceButton.setOnClickListener(v -> {
+            if (liveSessionRunning && directSession) {
+                startService(new Intent(this, GeminiLiveVoiceService.class)
+                        .setAction(GeminiLiveVoiceService.ACTION_STOP));
+                liveSessionRunning = false;
+                directSession = false;
+                updateVoiceButtons();
+            } else {
+                startDirectVoice();
+            }
+        });
     }
 
     private void updateAccessibilityState() {
@@ -595,7 +616,7 @@ public final class WazirGenZActivity extends Activity {
 
     private LinearLayout.LayoutParams buttonParams() {
         LinearLayout.LayoutParams params = matchWrap();
-        params.height = dp(50);
+        params.height = dp(52);
         params.topMargin = dp(9);
         return params;
     }
@@ -610,7 +631,6 @@ public final class WazirGenZActivity extends Activity {
             try {
                 unregisterReceiver(receiver);
             } catch (IllegalArgumentException ignored) {
-                // Already unregistered.
             }
             receiverRegistered = false;
         }
