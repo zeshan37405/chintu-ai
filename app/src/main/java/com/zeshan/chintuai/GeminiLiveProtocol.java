@@ -6,7 +6,7 @@ import org.json.JSONObject;
 
 /** Builds and parses the raw Gemini Live WebSocket messages used by Wazir. */
 public final class GeminiLiveProtocol {
-    /** Current Live model, followed by the older free-tier-compatible native-audio model. */
+    /** Current Live model, followed by the older native-audio fallback model. */
     public static final String[] MODELS = {
             "gemini-3.1-flash-live-preview",
             "gemini-2.5-flash-native-audio-preview-12-2025"
@@ -14,7 +14,7 @@ public final class GeminiLiveProtocol {
     /** Compatibility alias used by the existing structured-action bridge. */
     public static final String MODEL = MODELS[0];
     public static final int INPUT_SAMPLE_RATE = 16_000;
-    /** Retained for the dormant native-audio player class; 5.0.1 uses Live for transcription. */
+    /** Retained for the dormant native-audio player class; Live is used for transcription. */
     public static final int OUTPUT_SAMPLE_RATE = 24_000;
 
     private GeminiLiveProtocol() {
@@ -32,13 +32,15 @@ public final class GeminiLiveProtocol {
     }
 
     /**
-     * Minimal setup matching Google's current raw-WebSocket quickstart. Live transcribes the
-     * microphone; the existing Gemini REST brain plans and executes Android actions after the turn.
+     * Setup for the v1beta raw WebSocket endpoint. The Redmi recording from 5.0.1 showed server
+     * close code 1007 because responseModalities was incorrectly sent directly under setup.
+     * BidiGenerateContentSetup expects responseModalities inside generationConfig on this endpoint.
      */
     public static String setupMessage(boolean directMode, String model) throws JSONException {
         JSONObject setup = new JSONObject();
         setup.put("model", "models/" + model);
-        setup.put("responseModalities", new JSONArray().put("AUDIO"));
+        setup.put("generationConfig", new JSONObject()
+                .put("responseModalities", new JSONArray().put("AUDIO")));
         setup.put("systemInstruction", new JSONObject()
                 .put("parts", new JSONArray().put(new JSONObject().put("text",
                         systemInstruction(directMode)))));
