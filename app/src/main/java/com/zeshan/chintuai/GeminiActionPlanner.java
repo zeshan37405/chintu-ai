@@ -14,6 +14,7 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.util.Locale;
 
 /** Calls Gemini 2.5 Flash and extracts a forced structured phone-action function call. */
 public final class GeminiActionPlanner {
@@ -93,7 +94,7 @@ public final class GeminiActionPlanner {
 
         JSONObject actionProperties = new JSONObject()
                 .put("type", new JSONObject()
-                        .put("type", "STRING")
+                        .put("type", "string")
                         .put("description", "Exact Android action type")
                         .put("enum", new JSONArray()
                                 .put("OPEN_APP")
@@ -115,34 +116,34 @@ public final class GeminiActionPlanner {
                                 .put("SPEAK")
                                 .put("WAIT")))
                 .put("target", new JSONObject()
-                        .put("type", "STRING")
+                        .put("type", "string")
                         .put("description", "App, contact or visible button name; empty if unused"))
                 .put("text", new JSONObject()
-                        .put("type", "STRING")
+                        .put("type", "string")
                         .put("description", "Text to type, draft or speak; empty if unused"))
                 .put("direction", new JSONObject()
-                        .put("type", "STRING")
+                        .put("type", "string")
                         .put("description", "up, down, left or right; empty if unused"))
                 .put("query", new JSONObject()
-                        .put("type", "STRING")
+                        .put("type", "string")
                         .put("description", "Search query or exact local command; empty if unused"))
                 .put("delay_ms", new JSONObject()
-                        .put("type", "INTEGER")
+                        .put("type", "integer")
                         .put("description", "Optional wait before this action, 0 to 5000"));
 
         JSONObject actionSchema = new JSONObject()
-                .put("type", "OBJECT")
+                .put("type", "object")
                 .put("properties", actionProperties)
                 .put("required", new JSONArray().put("type"));
 
         JSONObject parameters = new JSONObject()
-                .put("type", "OBJECT")
+                .put("type", "object")
                 .put("properties", new JSONObject()
                         .put("reply", new JSONObject()
-                                .put("type", "STRING")
+                                .put("type", "string")
                                 .put("description", "Short Urdu acknowledgement or explanation"))
                         .put("actions", new JSONObject()
-                                .put("type", "ARRAY")
+                                .put("type", "array")
                                 .put("description", "Ordered safe Android actions")
                                 .put("items", actionSchema)))
                 .put("required", new JSONArray().put("reply").put("actions"));
@@ -206,7 +207,7 @@ public final class GeminiActionPlanner {
             JSONObject root = new JSONObject(response == null ? "{}" : response);
             JSONObject error = root.optJSONObject("error");
             String message = error == null ? "" : error.optString("message", "");
-            if (status == 400 && message.toLowerCase().contains("api key")) {
+            if (status == 400 && message.toLowerCase(Locale.ROOT).contains("api key")) {
                 return "Gemini API key درست یا فعال نہیں ہے";
             }
             if (status == 401 || status == 403) {
