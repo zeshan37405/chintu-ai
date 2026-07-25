@@ -3,6 +3,7 @@ package com.zeshan.chintuai;
 import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
 import android.content.BroadcastReceiver;
 import android.content.ComponentName;
@@ -17,10 +18,12 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.provider.Settings;
+import android.speech.RecognizerIntent;
 import android.view.Gravity;
 import android.view.ViewGroup;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
+import android.text.InputType;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
@@ -33,10 +36,12 @@ import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-/** Wazir Gen Z 4.0.1 command center with hands-free and guaranteed one-tap voice turns. */
+/** Wazir Gen Z 4.1 command center: one-shot voice transcript + Gemini structured actions. */
 @SuppressLint("UnspecifiedRegisterReceiverFlag")
 public final class WazirGenZActivity extends Activity {
     private static final int REQUEST_PERMISSIONS = 8101;
+    private static final int REQUEST_ONE_SHOT_VOICE = 8102;
+
     private static final int TOP = Color.rgb(2, 10, 20);
     private static final int BOTTOM = Color.rgb(8, 30, 46);
     private static final int CARD = Color.rgb(16, 42, 63);
@@ -44,6 +49,7 @@ public final class WazirGenZActivity extends Activity {
     private static final int CYAN = Color.rgb(67, 215, 255);
     private static final int GREEN = Color.rgb(72, 226, 157);
     private static final int AMBER = Color.rgb(255, 191, 83);
+    private static final int RED = Color.rgb(255, 103, 125);
     private static final int TEXT = Color.rgb(245, 250, 255);
     private static final int MUTED = Color.rgb(166, 187, 206);
 
@@ -53,6 +59,7 @@ public final class WazirGenZActivity extends Activity {
     private TextView detailView;
     private TextView engineView;
     private TextView latencyView;
+    private TextView aiView;
     private TextView accessibilityView;
     private EditText commandInput;
     private Button handsFreeButton;
@@ -78,9 +85,7 @@ public final class WazirGenZActivity extends Activity {
                 long latency = intent.getLongExtra(WazirVoiceService.EXTRA_LATENCY_MS, -1L);
                 if (command != null && !command.trim().isEmpty()) commandInput.setText(command);
                 if (latency >= 0L) latencyView.setText("Voice → action: " + latency + " ms");
-                if (result != null && !result.trim().isEmpty()) {
-                    setStatus("مکمل", result, GREEN);
-                }
+                if (result != null && !result.trim().isEmpty()) setStatus("مکمل", result, GREEN);
                 updateHandsFreeButton();
             }
         }
@@ -93,7 +98,10 @@ public final class WazirGenZActivity extends Activity {
         getWindow().setNavigationBarColor(TOP);
         setContentView(buildInterface());
         registerVoiceReceiver();
-        setStatus("وزیر تیار ہے", "ہینڈز فری یا فوری وائس کمانڈ استعمال کریں", GREEN);
+        updateAiState();
+        setStatus("وزیر تیار ہے",
+                "فوری وائس بٹن الگ one-shot transcript لیتا ہے؛ ہینڈز فری آن نہیں کرتا",
+                GREEN);
     }
 
     @Override
@@ -101,6 +109,7 @@ public final class WazirGenZActivity extends Activity {
         super.onResume();
         updateHandsFreeButton();
         updateAccessibilityState();
+        updateAiState();
     }
 
     private ScrollView buildInterface() {
@@ -126,9 +135,10 @@ public final class WazirGenZActivity extends Activity {
         header.addView(titles, new LinearLayout.LayoutParams(
                 0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         titles.addView(text("وزیر", 42, TEXT, true), matchWrap());
-        titles.addView(text("GEN Z • ECHO-SAFE VOICE CORE", 12, MUTED, false), matchWrap());
+        titles.addView(text("GEN Z • VOICE TRANSCRIPT • GEMINI BRAIN",
+                12, MUTED, false), matchWrap());
 
-        TextView badge = text("VOICE\n" + BuildConfig.VERSION_NAME, 11, TEXT, true);
+        TextView badge = text("GEN Z\n" + BuildConfig.VERSION_NAME, 11, TEXT, true);
         badge.setGravity(Gravity.CENTER);
         badge.setPadding(dp(12), dp(8), dp(12), dp(8));
         badge.setBackground(rounded(CARD_LIGHT, dp(18), CYAN));
@@ -139,7 +149,7 @@ public final class WazirGenZActivity extends Activity {
         coreParams.topMargin = dp(18);
         root.addView(core, coreParams);
 
-        TextView coreTitle = text("WAZIR VOICE TURN", 13, CYAN, true);
+        TextView coreTitle = text("WAZIR AI CORE", 13, CYAN, true);
         coreTitle.setGravity(Gravity.CENTER);
         core.addView(coreTitle, matchWrap());
         TextView orb = text("◉", 82, CYAN, false);
@@ -150,19 +160,21 @@ public final class WazirGenZActivity extends Activity {
         statusView = text("وزیر تیار ہے", 23, GREEN, true);
         statusView.setGravity(Gravity.CENTER);
         core.addView(statusView, matchWrap());
-        detailView = text("کہیں: وزیر، پھر پوری کمانڈ", 17, TEXT, false);
+        detailView = text("فوری وائس یا تحریری کمانڈ دیں", 17, TEXT, false);
         detailView.setGravity(Gravity.CENTER);
-        detailView.setMinHeight(dp(58));
+        detailView.setMinHeight(dp(66));
         detailView.setPadding(dp(4), dp(10), dp(4), dp(8));
         core.addView(detailView, matchWrap());
 
         LinearLayout telemetry = new LinearLayout(this);
-        telemetry.setOrientation(LinearLayout.HORIZONTAL);
+        telemetry.setOrientation(LinearLayout.VERTICAL);
         core.addView(telemetry, matchWrap());
         engineView = chip("Voice engine: waiting");
-        telemetry.addView(engineView, weightedWrap());
-        latencyView = chip("Voice → action: —");
-        telemetry.addView(latencyView, weightedWrap());
+        telemetry.addView(engineView, matchWrap());
+        aiView = chip("AI: checking Gemini key");
+        telemetry.addView(aiView, matchWrap());
+        latencyView = chip("Voice/AI → action: —");
+        telemetry.addView(latencyView, matchWrap());
 
         handsFreeButton = primaryButton("🎙  وزیر ہینڈز فری آن کریں");
         handsFreeButton.setOnClickListener(v -> toggleHandsFree());
@@ -171,33 +183,48 @@ public final class WazirGenZActivity extends Activity {
         handsParams.topMargin = dp(14);
         root.addView(handsFreeButton, handsParams);
 
-        Button listenNow = primaryButton("⚡ فوری وائس کمانڈ سنیں");
-        listenNow.setOnClickListener(v -> listenNow());
-        LinearLayout.LayoutParams nowParams = matchWrap();
-        nowParams.height = dp(58);
-        nowParams.topMargin = dp(10);
-        root.addView(listenNow, nowParams);
+        Button oneShot = primaryButton("⚡ فوری وائس → Gemini کمانڈ");
+        oneShot.setOnClickListener(v -> launchOneShotVoice());
+        LinearLayout.LayoutParams oneShotParams = matchWrap();
+        oneShotParams.height = dp(60);
+        oneShotParams.topMargin = dp(10);
+        root.addView(oneShot, oneShotParams);
 
-        TextView explanation = text(
-                "فوری وائس بٹن wake-word کا انتظار ختم کرتا ہے۔ ہینڈز فری میں صرف “وزیر” کہیں؛ "
-                        + "وزیر جواب بولنے کے بجائے ہلکی vibration دے گا، پھر آپ پوری کمانڈ بولیں۔",
+        TextView oneShotNote = text(
+                "یہ بٹن ہینڈز فری سروس شروع نہیں کرتا۔ Android کا one-shot voice recognizer "
+                        + "عبارت واپس دے گا، پھر Gemini اسے structured actions میں بدلے گا۔",
                 13, MUTED, false);
-        explanation.setPadding(dp(6), dp(10), dp(6), 0);
-        root.addView(explanation, matchWrap());
+        oneShotNote.setPadding(dp(6), dp(10), dp(6), 0);
+        root.addView(oneShotNote, matchWrap());
+
+        LinearLayout aiCard = card();
+        LinearLayout.LayoutParams aiParams = matchWrap();
+        aiParams.topMargin = dp(14);
+        root.addView(aiCard, aiParams);
+        aiCard.addView(text("GEMINI AI BRAIN", 15, CYAN, true), matchWrap());
+        TextView aiExplanation = text(
+                "Google Notes میں محفوظ Gemini key یہاں ایک بار paste کریں۔ Key GitHub یا APK "
+                        + "میں شامل نہیں ہوگی؛ فون کے Android Keystore سے encrypt ہوگی۔",
+                13, MUTED, false);
+        aiExplanation.setPadding(0, dp(7), 0, dp(6));
+        aiCard.addView(aiExplanation, matchWrap());
+        Button configureAi = secondaryButton("Gemini API key محفوظ / تبدیل کریں");
+        configureAi.setOnClickListener(v -> showGeminiKeyDialog());
+        aiCard.addView(configureAi, buttonParams());
 
         LinearLayout commandCard = card();
         LinearLayout.LayoutParams commandParams = matchWrap();
         commandParams.topMargin = dp(14);
         root.addView(commandCard, commandParams);
-        commandCard.addView(text("تحریری کمانڈ", 15, CYAN, true), matchWrap());
+        commandCard.addView(text("تحریری Gemini کمانڈ", 15, CYAN, true), matchWrap());
 
         commandInput = new EditText(this);
-        commandInput.setHint("مثلاً: واٹس ایپ کھولو");
+        commandInput.setHint("مثلاً: فیس بک کھولو، پوسٹ لکھو مگر شائع نہ کرنا");
         commandInput.setHintTextColor(MUTED);
         commandInput.setTextColor(TEXT);
         commandInput.setTextSize(17);
         commandInput.setGravity(Gravity.RIGHT | Gravity.CENTER_VERTICAL);
-        commandInput.setMaxLines(3);
+        commandInput.setMaxLines(4);
         commandInput.setImeOptions(EditorInfo.IME_ACTION_GO);
         commandInput.setPadding(dp(12), dp(12), dp(12), dp(12));
         commandInput.setBackground(rounded(TOP, dp(15), CARD_LIGHT));
@@ -212,7 +239,7 @@ public final class WazirGenZActivity extends Activity {
         inputParams.topMargin = dp(10);
         commandCard.addView(commandInput, inputParams);
 
-        Button run = primaryButton("کمانڈ چلائیں");
+        Button run = primaryButton("Gemini سے سمجھ کر کمانڈ چلائیں");
         run.setOnClickListener(v -> runTypedCommand());
         commandCard.addView(run, buttonParams());
 
@@ -236,8 +263,8 @@ public final class WazirGenZActivity extends Activity {
         setup.addView(battery, buttonParams());
 
         TextView safety = text(
-                "حفاظت: رقم کی منتقلی، PIN، پاس ورڈ اور حساس اکاؤنٹ تبدیلیاں بند ہیں۔ "
-                        + "Post/Send جیسے کام واضح تصدیق کے بعد ہوں گے۔",
+                "حفاظت: رقم کی منتقلی، خریداری، PIN، OTP، پاس ورڈ اور حساس اکاؤنٹ تبدیلیاں "
+                        + "AI plan میں بھی بند ہیں۔ Post/Send/Publish الگ تصدیق مانگیں گے۔",
                 13, MUTED, false);
         safety.setPadding(dp(5), dp(16), dp(5), 0);
         root.addView(safety, matchWrap());
@@ -249,7 +276,7 @@ public final class WazirGenZActivity extends Activity {
             startService(new Intent(this, WazirVoiceService.class)
                     .setAction(WazirVoiceService.ACTION_STOP));
             serviceReportedRunning = false;
-            setStatus("بند کر رہا ہوں", "وزیر کا مائیک بند ہو رہا ہے", AMBER);
+            setStatus("بند کر رہا ہوں", "وزیر کا مسلسل مائیک بند ہو رہا ہے", AMBER);
             updateHandsFreeButton();
             return;
         }
@@ -260,13 +287,129 @@ public final class WazirGenZActivity extends Activity {
         startVoiceService(WazirVoiceService.ACTION_START);
     }
 
-    private void listenNow() {
+    private void launchOneShotVoice() {
         if (!hasMicPermission()) {
             requestCorePermissions();
             return;
         }
-        startVoiceService(WazirVoiceService.ACTION_LISTEN_NOW);
-        setStatus("فوری کمانڈ", "اب پوری کمانڈ بولیں", CYAN);
+        Intent voice = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                        RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ur-PK")
+                .putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "ur-PK")
+                .putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 8)
+                .putExtra(RecognizerIntent.EXTRA_PROMPT,
+                        "وزیر کے لیے پوری کمانڈ بولیں");
+        try {
+            setStatus("فوری وائس سن رہا ہے",
+                    "یہ one-shot mode ہے؛ ہینڈز فری آن نہیں ہوگا", CYAN);
+            startActivityForResult(voice, REQUEST_ONE_SHOT_VOICE);
+        } catch (ActivityNotFoundException error) {
+            setStatus("Voice recognizer دستیاب نہیں",
+                    "Google Speech Services اپڈیٹ یا فعال کریں", AMBER);
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQUEST_ONE_SHOT_VOICE) return;
+        if (resultCode != RESULT_OK || data == null) {
+            setStatus("فوری وائس منسوخ ہوئی",
+                    "دوبارہ بٹن دبائیں اور پوری کمانڈ بولیں", AMBER);
+            return;
+        }
+        ArrayList<String> matches =
+                data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS);
+        String transcript = CommandEngine.chooseBest(matches);
+        if (transcript.isEmpty()) {
+            setStatus("عبارت نہیں ملی", "دوبارہ واضح کمانڈ بولیں", AMBER);
+            return;
+        }
+        commandInput.setText(transcript);
+        setStatus("Voice transcript مل گیا", transcript, CYAN);
+        runAiCommand(transcript, "Voice");
+    }
+
+    private void runTypedCommand() {
+        String command = commandInput.getText().toString().trim();
+        if (command.isEmpty()) {
+            Toast.makeText(this, "کمانڈ لکھیں", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        hideKeyboard();
+        runAiCommand(command, "Typed");
+    }
+
+    private void runAiCommand(String command, String source) {
+        setStatus("Gemini سمجھ رہا ہے", command, CYAN);
+        aiView.setText("AI: planning structured actions…");
+        long started = android.os.SystemClock.uptimeMillis();
+        worker.execute(() -> {
+            WazirAiBrain.Execution execution =
+                    WazirAiBrain.execute(getApplicationContext(), command);
+            long latency = android.os.SystemClock.uptimeMillis() - started;
+            runOnUiThread(() -> {
+                aiView.setText("AI: " + execution.mode);
+                latencyView.setText(source + "/AI → action: " + latency + " ms");
+                setStatus(execution.result.handled ? "مکمل" : "کمانڈ مکمل نہیں ہوئی",
+                        execution.result.message,
+                        execution.result.handled ? GREEN : AMBER);
+            });
+        });
+    }
+
+    private void showGeminiKeyDialog() {
+        LinearLayout container = new LinearLayout(this);
+        container.setOrientation(LinearLayout.VERTICAL);
+        container.setPadding(dp(22), dp(8), dp(22), 0);
+
+        TextView note = new TextView(this);
+        note.setText(WazirSecretStore.hasGeminiApiKey(this)
+                ? "Gemini key پہلے سے محفوظ ہے۔ تبدیل کرنے کے لیے نئی key paste کریں۔"
+                : "Google Notes سے Gemini API key paste کریں۔ اسے chat یا GitHub میں مت بھیجیں۔");
+        note.setTextSize(14);
+        container.addView(note, matchWrap());
+
+        EditText input = new EditText(this);
+        input.setHint("Gemini API key");
+        input.setSingleLine(true);
+        input.setInputType(InputType.TYPE_CLASS_TEXT
+                | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        LinearLayout.LayoutParams inputParams = matchWrap();
+        inputParams.topMargin = dp(8);
+        container.addView(input, inputParams);
+
+        new AlertDialog.Builder(this)
+                .setTitle("Gemini AI Brain")
+                .setView(container)
+                .setPositiveButton("محفوظ کریں", (dialog, which) -> {
+                    boolean saved = WazirSecretStore.saveGeminiApiKey(
+                            getApplicationContext(), input.getText().toString());
+                    Toast.makeText(this,
+                            saved ? "Gemini key encrypted ہو کر محفوظ ہو گئی"
+                                    : "Key درست طرح محفوظ نہیں ہوئی",
+                            Toast.LENGTH_LONG).show();
+                    updateAiState();
+                })
+                .setNeutralButton("Key حذف کریں", (dialog, which) -> {
+                    WazirSecretStore.clearGeminiApiKey(getApplicationContext());
+                    updateAiState();
+                    Toast.makeText(this, "Gemini key حذف ہو گئی", Toast.LENGTH_SHORT).show();
+                })
+                .setNegativeButton("منسوخ", null)
+                .show();
+    }
+
+    private void updateAiState() {
+        if (aiView == null) return;
+        if (WazirSecretStore.hasGeminiApiKey(this)) {
+            aiView.setText("AI: Gemini 2.5 Flash • key encrypted");
+            aiView.setTextColor(GREEN);
+        } else {
+            aiView.setText("AI: Gemini key درکار • ابھی local rules");
+            aiView.setTextColor(AMBER);
+        }
     }
 
     private void startVoiceService(String action) {
@@ -275,9 +418,12 @@ public final class WazirGenZActivity extends Activity {
             if (Build.VERSION.SDK_INT >= 26) startForegroundService(start);
             else startService(start);
             serviceReportedRunning = true;
+            setStatus("وزیر ہینڈز فری شروع ہو رہا ہے",
+                    "مسلسل wake word mode؛ فوری وائس بٹن اس سے الگ ہے", CYAN);
             updateHandsFreeButton();
         } catch (RuntimeException error) {
-            setStatus("وائس شروع نہیں ہوئی", "Microphone اور Notifications اجازت چیک کریں", AMBER);
+            setStatus("ہینڈز فری شروع نہیں ہوئی",
+                    "Microphone اور Notifications اجازت چیک کریں", AMBER);
         }
     }
 
@@ -310,30 +456,12 @@ public final class WazirGenZActivity extends Activity {
     public void onRequestPermissionsResult(int requestCode, String[] permissions,
                                            int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        if (requestCode == REQUEST_PERMISSIONS && hasMicPermission()) {
-            Toast.makeText(this, "وزیر کی اجازتیں محفوظ ہو گئیں", Toast.LENGTH_SHORT).show();
+        if (requestCode == REQUEST_PERMISSIONS) {
+            Toast.makeText(this,
+                    hasMicPermission() ? "وزیر کی اجازتیں محفوظ ہو گئیں"
+                            : "Microphone اجازت ضروری ہے",
+                    Toast.LENGTH_SHORT).show();
         }
-    }
-
-    private void runTypedCommand() {
-        String command = commandInput.getText().toString().trim();
-        if (command.isEmpty()) {
-            Toast.makeText(this, "کمانڈ لکھیں", Toast.LENGTH_SHORT).show();
-            return;
-        }
-        hideKeyboard();
-        setStatus("عمل کر رہا ہوں", command, CYAN);
-        long started = android.os.SystemClock.uptimeMillis();
-        worker.execute(() -> {
-            BackgroundCommandExecutor.Result result =
-                    BackgroundCommandExecutor.execute(getApplicationContext(), command);
-            long latency = android.os.SystemClock.uptimeMillis() - started;
-            runOnUiThread(() -> {
-                latencyView.setText("Typed → action: " + latency + " ms");
-                setStatus(result.handled ? "مکمل" : "کمانڈ مکمل نہیں ہوئی",
-                        result.message, result.handled ? GREEN : AMBER);
-            });
-        });
     }
 
     private void registerVoiceReceiver() {
@@ -347,13 +475,14 @@ public final class WazirGenZActivity extends Activity {
     }
 
     private void updateHandsFreeButton() {
+        if (handsFreeButton == null) return;
         boolean enabled = serviceReportedRunning || WazirVoiceService.isEnabled(this);
         handsFreeButton.setText(enabled
                 ? "■  وزیر ہینڈز فری بند کریں"
                 : "🎙  وزیر ہینڈز فری آن کریں");
         handsFreeButton.setBackground(rounded(
                 enabled ? Color.rgb(146, 52, 67) : Color.rgb(25, 137, 181),
-                dp(22), enabled ? Color.rgb(255, 103, 125) : CYAN));
+                dp(22), enabled ? RED : CYAN));
     }
 
     private void updateAccessibilityState() {
@@ -427,10 +556,13 @@ public final class WazirGenZActivity extends Activity {
     }
 
     private TextView chip(String value) {
-        TextView view = text(value, 11, MUTED, false);
+        TextView view = text(value, 12, MUTED, false);
         view.setGravity(Gravity.CENTER);
         view.setPadding(dp(8), dp(8), dp(8), dp(8));
         view.setBackground(rounded(TOP, dp(16), CARD_LIGHT));
+        LinearLayout.LayoutParams params = matchWrap();
+        params.topMargin = dp(5);
+        view.setLayoutParams(params);
         return view;
     }
 
@@ -455,22 +587,19 @@ public final class WazirGenZActivity extends Activity {
         return new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
     }
+
     private LinearLayout.LayoutParams wrapWrap() {
         return new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
     }
-    private LinearLayout.LayoutParams weightedWrap() {
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
-                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-        params.setMargins(dp(4), dp(2), dp(4), dp(2));
-        return params;
-    }
+
     private LinearLayout.LayoutParams buttonParams() {
         LinearLayout.LayoutParams params = matchWrap();
         params.height = dp(50);
         params.topMargin = dp(9);
         return params;
     }
+
     private int dp(int value) {
         return Math.round(value * getResources().getDisplayMetrics().density);
     }
@@ -478,7 +607,11 @@ public final class WazirGenZActivity extends Activity {
     @Override
     protected void onDestroy() {
         if (receiverRegistered) {
-            try { unregisterReceiver(receiver); } catch (IllegalArgumentException ignored) { }
+            try {
+                unregisterReceiver(receiver);
+            } catch (IllegalArgumentException ignored) {
+                // Already unregistered.
+            }
             receiverRegistered = false;
         }
         worker.shutdownNow();
