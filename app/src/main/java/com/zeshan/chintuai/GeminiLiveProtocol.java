@@ -32,16 +32,13 @@ public final class GeminiLiveProtocol {
     }
 
     /**
-     * Minimal cross-version handshake. Live only transcribes the microphone; the existing Gemini
-     * REST brain plans and executes Android actions after turnComplete. Removing the large function
-     * schema and optional compression/resumption fields makes setup failures observable and avoids
-     * the 5.0 state where the WebSocket opened but setupComplete never arrived.
+     * Minimal setup matching Google's current raw-WebSocket quickstart. Live transcribes the
+     * microphone; the existing Gemini REST brain plans and executes Android actions after the turn.
      */
     public static String setupMessage(boolean directMode, String model) throws JSONException {
         JSONObject setup = new JSONObject();
         setup.put("model", "models/" + model);
-        setup.put("generationConfig", new JSONObject()
-                .put("responseModalities", new JSONArray().put("AUDIO")));
+        setup.put("responseModalities", new JSONArray().put("AUDIO"));
         setup.put("systemInstruction", new JSONObject()
                 .put("parts", new JSONArray().put(new JSONObject().put("text",
                         systemInstruction(directMode)))));
