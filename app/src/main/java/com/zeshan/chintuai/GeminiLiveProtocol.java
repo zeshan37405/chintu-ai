@@ -11,7 +11,11 @@ public final class GeminiLiveProtocol {
             "gemini-3.1-flash-live-preview",
             "gemini-2.5-flash-native-audio-preview-12-2025"
     };
+    /** Compatibility alias used by the existing structured-action bridge. */
+    public static final String MODEL = MODELS[0];
     public static final int INPUT_SAMPLE_RATE = 16_000;
+    /** Retained for the dormant native-audio player class; 5.0.1 uses Live for transcription. */
+    public static final int OUTPUT_SAMPLE_RATE = 24_000;
 
     private GeminiLiveProtocol() {
     }
