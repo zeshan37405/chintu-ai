@@ -3,28 +3,38 @@ package com.zeshan.chintuai;
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.AccessibilityServiceInfo;
 import android.accessibilityservice.GestureDescription;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.graphics.Path;
+import android.graphics.Rect;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 
 import java.lang.ref.WeakReference;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Optional user-enabled service for explicit Jarvis-style screen actions. Screen content is used
- * only in memory to locate the requested control and is never stored or transmitted.
+ * User-enabled screen control for Wazir. Window content is queried in memory only when an explicit
+ * command is executed; it is never stored or uploaded. Node actions are preferred, with coordinate
+ * gestures and clipboard input as fallbacks for Facebook and other custom-rendered applications.
  */
 public final class ChintuAccessibilityService extends AccessibilityService {
     private static WeakReference<ChintuAccessibilityService> active = new WeakReference<>(null);
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
+    private static volatile String activePackage = "";
+    private static volatile long lastWindowEventAt;
+    private int gestureSequence;
 
     @Override
     protected void onServiceConnected() {
@@ -34,6 +44,7 @@ public final class ChintuAccessibilityService extends AccessibilityService {
             info.flags |= AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
                     | AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
                     | AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS;
+            info.notificationTimeout = 80L;
             setServiceInfo(info);
         }
         active = new WeakReference<>(this);
@@ -42,21 +53,39 @@ public final class ChintuAccessibilityService extends AccessibilityService {
     @Override
     public boolean onUnbind(android.content.Intent intent) {
         active.clear();
+        activePackage = "";
         return super.onUnbind(intent);
     }
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        // No event stream is stored. Commands query the current window only when explicitly asked.
+        if (event == null) return;
+        CharSequence packageName = event.getPackageName();
+        if (packageName != null) activePackage = packageName.toString();
+        int type = event.getEventType();
+        if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+                || type == AccessibilityEvent.TYPE_WINDOWS_CHANGED
+                || type == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+                || type == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
+            lastWindowEventAt = SystemClock.uptimeMillis();
+        }
     }
 
     @Override
     public void onInterrupt() {
-        // No continuous accessibility feedback.
+        // No continuous feedback is generated.
     }
 
     public static boolean isConnected() {
         return active.get() != null;
+    }
+
+    public static String getActivePackageName() {
+        return activePackage;
+    }
+
+    public static long getLastWindowEventAt() {
+        return lastWindowEventAt;
     }
 
     public static boolean perform(int action) {
@@ -111,7 +140,7 @@ public final class ChintuAccessibilityService extends AccessibilityService {
             MAIN.postDelayed(() -> {
                 ChintuAccessibilityService current = active.get();
                 if (current != null) current.setFocusedText(text, false);
-            }, 700L);
+            }, 850L);
             return true;
         });
     }
@@ -152,7 +181,7 @@ public final class ChintuAccessibilityService extends AccessibilityService {
             }
         });
         try {
-            latch.await(2, TimeUnit.SECONDS);
+            latch.await(3, TimeUnit.SECONDS);
         } catch (InterruptedException error) {
             Thread.currentThread().interrupt();
         }
@@ -162,12 +191,20 @@ public final class ChintuAccessibilityService extends AccessibilityService {
     private boolean scroll(boolean forward) {
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root != null) {
-            AccessibilityNodeInfo scrollable = findBestScrollable(root);
-            if (scrollable != null) {
-                int action = forward
-                        ? AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
-                        : AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD;
-                if (scrollable.performAction(action)) return true;
+            List<NodeArea> candidates = findScrollableCandidates(root);
+            int action = forward
+                    ? AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
+                    : AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD;
+            for (NodeArea candidate : candidates) {
+                try {
+                    if (candidate.node.performAction(action)) return true;
+                } catch (RuntimeException ignored) {
+                    // Try another candidate or a raw gesture.
+                }
+            }
+            try {
+                if (root.performAction(action)) return true;
+            } catch (RuntimeException ignored) {
             }
         }
         return dispatchVerticalSwipe(forward);
@@ -177,18 +214,28 @@ public final class ChintuAccessibilityService extends AccessibilityService {
         int width = getResources().getDisplayMetrics().widthPixels;
         int height = getResources().getDisplayMetrics().heightPixels;
         float y = height * 0.55f;
-        float startX = left ? width * 0.84f : width * 0.16f;
-        float endX = left ? width * 0.16f : width * 0.84f;
-        return dispatchStroke(startX, y, endX, y, 430L);
+        float startX = left ? width * 0.86f : width * 0.14f;
+        float endX = left ? width * 0.14f : width * 0.86f;
+        return dispatchStroke(startX, y, endX, y, 470L);
     }
 
     private boolean dispatchVerticalSwipe(boolean forward) {
         int width = getResources().getDisplayMetrics().widthPixels;
         int height = getResources().getDisplayMetrics().heightPixels;
-        float x = width * 0.52f;
-        float startY = forward ? height * 0.80f : height * 0.28f;
-        float endY = forward ? height * 0.27f : height * 0.81f;
-        return dispatchStroke(x, startY, x, endY, 500L);
+        float[] xChoices = {0.52f, 0.72f, 0.32f};
+        float x = width * xChoices[Math.abs(gestureSequence++) % xChoices.length];
+        float startY = forward ? height * 0.82f : height * 0.25f;
+        float endY = forward ? height * 0.24f : height * 0.83f;
+        return dispatchStroke(x, startY, x, endY, 560L);
+    }
+
+    private boolean dispatchTap(float x, float y) {
+        Path path = new Path();
+        path.moveTo(x, y);
+        GestureDescription gesture = new GestureDescription.Builder()
+                .addStroke(new GestureDescription.StrokeDescription(path, 0L, 90L))
+                .build();
+        return dispatchGesture(gesture, null, MAIN);
     }
 
     private boolean dispatchStroke(float startX, float startY,
@@ -217,8 +264,12 @@ public final class ChintuAccessibilityService extends AccessibilityService {
         AccessibilityNodeInfo editable = findEditableNode();
         if (editable != null) {
             editable.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
-            return editable.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                    || editable.isFocused();
+            if (editable.performAction(AccessibilityNodeInfo.ACTION_CLICK) || editable.isFocused()) {
+                return true;
+            }
+            Rect bounds = new Rect();
+            editable.getBoundsInScreen(bounds);
+            return !bounds.isEmpty() && dispatchTap(bounds.exactCenterX(), bounds.exactCenterY());
         }
         return false;
     }
@@ -232,7 +283,14 @@ public final class ChintuAccessibilityService extends AccessibilityService {
         arguments.putCharSequence(
                 AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
                 clearOnly ? "" : text);
-        return node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments);
+        if (node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments)) return true;
+        if (clearOnly) return false;
+
+        ClipboardManager clipboard =
+                (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        if (clipboard == null) return false;
+        clipboard.setPrimaryClip(ClipData.newPlainText("Wazir text", text));
+        return node.performAction(AccessibilityNodeInfo.ACTION_PASTE);
     }
 
     private boolean pasteFocused() {
@@ -297,7 +355,7 @@ public final class ChintuAccessibilityService extends AccessibilityService {
                 if (child != null) queue.addLast(child);
             }
         }
-        return best != null && bestScore >= 72 && clickNodeOrParent(best);
+        return best != null && bestScore >= 70 && clickNodeOrParent(best);
     }
 
     private int matchScore(String target, String candidate) {
@@ -309,13 +367,16 @@ public final class ChintuAccessibilityService extends AccessibilityService {
 
     private boolean clickNodeOrParent(AccessibilityNodeInfo node) {
         AccessibilityNodeInfo current = node;
-        for (int depth = 0; current != null && depth < 8; depth++) {
+        for (int depth = 0; current != null && depth < 10; depth++) {
             if (current.isClickable() && current.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
                 return true;
             }
             current = current.getParent();
         }
-        return node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+        if (node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true;
+        Rect bounds = new Rect();
+        node.getBoundsInScreen(bounds);
+        return !bounds.isEmpty() && dispatchTap(bounds.exactCenterX(), bounds.exactCenterY());
     }
 
     private AccessibilityNodeInfo findEditableNode() {
@@ -341,28 +402,39 @@ public final class ChintuAccessibilityService extends AccessibilityService {
         return firstEditable;
     }
 
-    private AccessibilityNodeInfo findBestScrollable(AccessibilityNodeInfo root) {
+    private List<NodeArea> findScrollableCandidates(AccessibilityNodeInfo root) {
         ArrayDeque<AccessibilityNodeInfo> queue = new ArrayDeque<>();
         queue.add(root);
-        AccessibilityNodeInfo best = null;
-        int bestArea = -1;
-        android.graphics.Rect bounds = new android.graphics.Rect();
+        List<NodeArea> values = new ArrayList<>();
+        Rect bounds = new Rect();
         while (!queue.isEmpty()) {
             AccessibilityNodeInfo node = queue.removeFirst();
-            if (node.isScrollable()) {
+            boolean hasScrollAction = node.getActionList().contains(
+                    AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_FORWARD)
+                    || node.getActionList().contains(
+                    AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_BACKWARD);
+            if (node.isScrollable() || hasScrollAction) {
                 node.getBoundsInScreen(bounds);
                 int area = Math.max(0, bounds.width()) * Math.max(0, bounds.height());
-                if (area > bestArea) {
-                    best = node;
-                    bestArea = area;
-                }
+                values.add(new NodeArea(node, area));
             }
             for (int i = 0; i < node.getChildCount(); i++) {
                 AccessibilityNodeInfo child = node.getChild(i);
                 if (child != null) queue.addLast(child);
             }
         }
-        return best;
+        values.sort(Comparator.comparingInt((NodeArea value) -> value.area).reversed());
+        return values;
+    }
+
+    private static final class NodeArea {
+        final AccessibilityNodeInfo node;
+        final int area;
+
+        NodeArea(AccessibilityNodeInfo node, int area) {
+            this.node = node;
+            this.area = area;
+        }
     }
 
     private interface ServiceAction {
