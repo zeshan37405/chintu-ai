@@ -99,9 +99,16 @@ public final class AccentCommandNormalizer {
         addMany(map, "گوگل میپس", "गूगल मैप्स");
 
         // Wake word variants.
+        addMany(map, "وزیر",
+                "वज़ीर", "वजीर", "वज़ीर",
+                "wazir", "wazeer", "vazir", "vazeer");
         addMany(map, "چنٹو", "चिंटू", "चिन्टू", "चिंटु", "चिन्टु", "chintoo", "chinto");
 
         // Common Hindi and Roman command words.
+        addMany(map, "یہ ہے", "यह है", "ये है");
+        addMany(map, "جی", "जी");
+        addMany(map, "جلدی کرو", "जल्दी करो", "jaldi karo");
+        addMany(map, "اس کو", "उसको", "उस को", "usko", "isko");
         addMany(map, "کھولو", "खोलो", "खोल दो", "ओपन करो", "open karo", "open kar do");
         addMany(map, "چلاؤ", "चलाओ", "चला दो", "launch karo");
         addMany(map, "نیچے سکرول کرو", "नीचे स्क्रॉल करो", "स्क्रॉल डाउन", "scroll down", "नीचे scroll करो");
@@ -120,7 +127,7 @@ public final class AccentCommandNormalizer {
         addMany(map, "بند کرو", "बंद करो", "ऑफ करो", "off karo");
         addMany(map, "آن کرو", "ऑन करो", "on karo");
         addMany(map, "اور پھر", "और फिर", "and then");
-        addMany(map, "اور", "और", "and");
+        addMany(map, "اور", "और", "aur", "and");
         addMany(map, "پھر", "फिर", "then");
 
         return map;

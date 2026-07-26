@@ -51,9 +51,9 @@ public final class GeminiLiveProtocol {
                 .put("automaticActivityDetection", new JSONObject()
                         .put("disabled", false)
                         .put("startOfSpeechSensitivity", "START_SENSITIVITY_HIGH")
-                        .put("endOfSpeechSensitivity", "END_SENSITIVITY_LOW")
+                        .put("endOfSpeechSensitivity", "END_SENSITIVITY_HIGH")
                         .put("prefixPaddingMs", 250)
-                        .put("silenceDurationMs", 1_200))
+                        .put("silenceDurationMs", 900))
                 .put("activityHandling", "START_OF_ACTIVITY_INTERRUPTS")
                 .put("turnCoverage", "TURN_INCLUDES_ONLY_ACTIVITY"));
         return new JSONObject().put("setup", setup).toString();
@@ -103,6 +103,9 @@ public final class GeminiLiveProtocol {
                 : "This is hands-free mode. Ignore speech that does not begin with the wake word وزیر, وزیر جی, Wazir, Wazeer or Vazir.";
         return "You are Wazir, Zeeshan's Urdu-first Android voice assistant. "
                 + mode + " Listen to the entire sentence and tolerate natural pauses. "
+                + "Interpret the speaker as Urdu/Hindustani (ur-PK). Use only Pakistani Urdu "
+                + "Perso-Arabic script for any textual wording; never use Devanagari, Roman Urdu, "
+                + "Bengali, Gurmukhi or another Indic script. "
                 + "Do not call tools in this Live session. The Android app will use the input transcription after the user's turn ends. "
                 + "Give at most one very short Urdu acknowledgement so turnComplete is emitted. Never repeat the full command. "
                 + "Never ask for PIN, password, OTP or payment information.";

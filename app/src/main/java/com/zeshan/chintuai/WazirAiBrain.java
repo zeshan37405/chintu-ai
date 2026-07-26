@@ -25,11 +25,34 @@ public final class WazirAiBrain {
     }
 
     public static Execution execute(Context context, String rawCommand) {
-        String command = rawCommand == null ? "" : rawCommand.trim();
+        String command = UrduTranscriptNormalizer.toUrduScript(rawCommand);
         if (command.isEmpty()) {
             return new Execution(
                     BackgroundCommandExecutor.Result.fail("کمانڈ خالی ہے"),
                     false, "Local", "empty transcript");
+        }
+
+        GeminiActionPlan fastPlan = LocalActionPlanner.plan(command);
+        if (fastPlan != null) {
+            BackgroundCommandExecutor.Result result =
+                    StructuredActionExecutor.execute(context, command, fastPlan);
+            return new Execution(result, false, "Local fast actions",
+                    "network-free actions: " + fastPlan.actions.size());
+        }
+
+        BackgroundCommandExecutor.Result automation =
+                JarvisAutomationExecutor.tryExecute(context, command);
+        if (automation != null) {
+            return new Execution(automation, false, "Local fast actions",
+                    "network-free accessibility action");
+        }
+
+        CommandEngine.ParsedCommand parsed = CommandEngine.parse(command);
+        if (parsed.type != CommandEngine.Type.UNKNOWN) {
+            BackgroundCommandExecutor.Result local =
+                    BackgroundCommandExecutor.execute(context, command);
+            return new Execution(local, false, "Local fast actions",
+                    "network-free command: " + parsed.type.name());
         }
 
         if (!WazirSecretStore.hasGeminiApiKey(context)) {

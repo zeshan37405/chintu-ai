@@ -83,6 +83,7 @@ public final class GeminiLiveVoiceService extends Service {
     private static final long DIRECT_INITIAL_TIMEOUT_MS = 45_000L;
     private static final long DIRECT_ACTIVE_TIMEOUT_MS = 20_000L;
     private static final long TURN_SETTLE_MS = 650L;
+    private static final long TRANSCRIPT_IDLE_MS = 1_800L;
     private static final long WAKE_LOCK_TIMEOUT_MS = 10L * 60L * 1_000L;
     private static final long WAKE_LOCK_RENEW_MS = 9L * 60L * 1_000L;
 
@@ -317,7 +318,7 @@ public final class GeminiLiveVoiceService extends Service {
                 return;
             }
             JSONObject serverContent = root.optJSONObject("serverContent");
-            if (serverContent != null) processServerContent(serverContent);
+            if (serverContent != null) processServerContent(ticket, serverContent);
             if (root.has("goAway")) {
                 broadcastStatus("Gemini session تازہ ہو رہی ہے",
                         "Server نے reconnect کہا ہے", false);
@@ -329,34 +330,49 @@ public final class GeminiLiveVoiceService extends Service {
         }
     }
 
-    private void processServerContent(JSONObject content) {
+    private void processServerContent(int ticket, JSONObject content) {
         JSONObject input = content.optJSONObject("inputTranscription");
         if (input != null) {
             String update = input.optString("text", "").trim();
             if (!update.isEmpty()) {
                 if (speechStartedAt == 0L) speechStartedAt = SystemClock.uptimeMillis();
-                transcript = LiveTranscriptGate.merge(transcript, update);
+                String urduUpdate = UrduTranscriptNormalizer.toUrduScript(update);
+                transcript = LiveTranscriptGate.merge(transcript, urduUpdate);
                 broadcastTranscript(transcript);
                 broadcastStatus("سن رہا ہوں", transcript, false);
                 if (directMode) armDirectTimeout(DIRECT_ACTIVE_TIMEOUT_MS);
+                // Input transcription is independent of model output and has no "finished" flag.
+                // Execute after a quiet interval even if no model turnComplete event arrives.
+                scheduleTurnExecution(ticket, TRANSCRIPT_IDLE_MS);
             }
         }
-        if (content.optBoolean("turnComplete", false)) {
-            scheduleTurnExecution();
+        if (content.optBoolean("generationComplete", false)
+                || content.optBoolean("turnComplete", false)) {
+            // generationComplete arrives before the model's simulated audio playback delay.
+            scheduleTurnExecution(ticket, TURN_SETTLE_MS);
         }
     }
 
-    private void scheduleTurnExecution() {
+    private void scheduleTurnExecution(int ticket, long delayMs) {
         removeTurnRunnable();
-        String snapshot = transcript.trim();
-        turnRunnable = () -> executeTranscript(snapshot);
-        main.postDelayed(turnRunnable, TURN_SETTLE_MS);
+        turnRunnable = () -> {
+            if (ticket != generation.get() || manualStop || commandRunning) return;
+            String latest = transcript.trim();
+            if (!latest.isEmpty()) executeTranscript(latest);
+        };
+        main.postDelayed(turnRunnable, Math.max(100L, delayMs));
     }
 
     private void executeTranscript(String snapshot) {
         if (manualStop || commandRunning || snapshot == null) return;
-        String heard = snapshot.trim();
+        String heard = UrduTranscriptNormalizer.toUrduScript(snapshot);
         if (!LiveTranscriptGate.isUsableCommand(heard, directMode)) {
+            if (!directMode && LiveTranscriptGate.hasWakeWord(heard)
+                    && LiveTranscriptGate.commandAfterWakeWord(heard).length() < 2) {
+                broadcastStatus("وزیر سن رہا ہے",
+                        "اب پوری کمانڈ بولیں", false);
+                return;
+            }
             transcript = "";
             speechStartedAt = 0L;
             broadcastStatus(directMode ? "فوری Live Voice سن رہا ہے" : "وزیر Live تیار ہے",
@@ -645,7 +661,7 @@ public final class GeminiLiveVoiceService extends Service {
                 .setPackage(getPackageName())
                 .putExtra(EXTRA_COMMAND, command == null ? "" : command)
                 .putExtra(EXTRA_RESULT, result == null ? "" : result)
-                .putExtra(EXTRA_ENGINE, "Live transcript → Gemini REST")
+                .putExtra(EXTRA_ENGINE, "Gemini Live transcript → Android actions")
                 .putExtra(EXTRA_MODE, mode == null ? "Gemini" : mode)
                 .putExtra(EXTRA_LATENCY_MS, latency));
     }

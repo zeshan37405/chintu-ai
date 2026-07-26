@@ -39,4 +39,13 @@ public class AccentCommandNormalizerTest {
         assertTrue(whatsapp.score >= 95);
         assertTrue(facebook.score >= 95);
     }
+
+    @Test
+    public void fullSentenceFacebookCommandDoesNotSelectLite() {
+        AppCatalog.AppMatch facebook = AppCatalog.findBest(
+                "یہ ہے جی جیمنی لائیو وزیر فیس بک کھولو جلدی کرو");
+
+        assertNotNull(facebook);
+        assertEquals("Facebook", facebook.app.displayName);
+    }
 }

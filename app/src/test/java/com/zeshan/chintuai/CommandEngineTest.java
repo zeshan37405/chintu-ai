@@ -33,6 +33,16 @@ public class CommandEngineTest {
     }
 
     @Test
+    public void stripsWazirAcrossUrduHindiAndRomanForms() {
+        assertEquals("علی کو کال کرو",
+                CommandEngine.stripWakeWord("وزیر علی کو کال کرو"));
+        assertEquals("facebook kholo",
+                CommandEngine.stripWakeWord("Wazir Facebook kholo"));
+        assertEquals("فیس بک کھولو",
+                CommandEngine.stripWakeWord("वज़ीर फेसबुक खोलो"));
+    }
+
+    @Test
     public void parsesFullPhoneControls() {
         assertEquals(CommandEngine.Type.GLOBAL_HOME,
                 CommandEngine.parse("ہوم اسکرین کھولو").type);

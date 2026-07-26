@@ -18,17 +18,19 @@ public final class LiveTranscriptGate {
     }
 
     public static boolean hasWakeWord(String transcript) {
-        String value = AccentCommandNormalizer.canonicalize(transcript == null ? "" : transcript);
+        String value = AccentCommandNormalizer.canonicalize(
+                UrduTranscriptNormalizer.toUrduScript(transcript));
         return WazirWakeWord.startsWithWakeWord(value);
     }
 
     public static String commandAfterWakeWord(String transcript) {
-        String value = AccentCommandNormalizer.canonicalize(transcript == null ? "" : transcript);
+        String value = AccentCommandNormalizer.canonicalize(
+                UrduTranscriptNormalizer.toUrduScript(transcript));
         return WazirWakeWord.startsWithWakeWord(value) ? WazirWakeWord.strip(value) : value.trim();
     }
 
     public static boolean isUsableCommand(String transcript, boolean directMode) {
-        String value = transcript == null ? "" : transcript.trim();
+        String value = UrduTranscriptNormalizer.toUrduScript(transcript);
         if (value.length() < 2) return false;
         if (!directMode && !hasWakeWord(value)) return false;
         String command = directMode ? value : commandAfterWakeWord(value);

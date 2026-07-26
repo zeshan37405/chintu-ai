@@ -39,4 +39,13 @@ public final class LiveTranscriptGateTest {
     public void acceptsRomanWazirVariant() {
         assertTrue(LiveTranscriptGate.hasWakeWord("Wazir Facebook open karo"));
     }
+
+    @Test
+    public void acceptsAndStripsVideoRomanTranscriptAsUrdu() {
+        String transcript = "Wazir Facebook kholo aur scroll karo usko.";
+
+        assertTrue(LiveTranscriptGate.isUsableCommand(transcript, false));
+        assertEquals("فیس بک کھولو اور سکرول کرو اس کو",
+                LiveTranscriptGate.commandAfterWakeWord(transcript));
+    }
 }

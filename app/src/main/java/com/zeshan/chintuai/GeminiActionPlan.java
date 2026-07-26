@@ -92,6 +92,12 @@ public final class GeminiActionPlan {
         return new GeminiActionPlan(reply, actions);
     }
 
+    static GeminiActionPlan local(String reply, List<Action> actions) {
+        List<Action> safeActions = actions == null
+                ? Collections.emptyList() : new ArrayList<>(actions);
+        return new GeminiActionPlan(reply, safeActions);
+    }
+
     private static String safe(String value, int maxLength) {
         String safe = value == null ? "" : value.trim();
         if (safe.length() <= maxLength) return safe;

@@ -3,7 +3,7 @@ name: Build Android APK
 on:
   workflow_dispatch:
   push:
-    branches: ["main", "agent/fix-gemini-live-binary-frames"]
+    branches: ["main", "agent/fix-live-command-execution-urdu"]
   pull_request:
     branches: ["main"]
 
@@ -61,7 +61,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: wazir-gen-z-5.0.3-live-binary-frame-fix-debug-apk
+          name: wazir-gen-z-5.0.4-command-execution-urdu-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14
@@ -70,7 +70,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: wazir-5.0.3-build-log
+          name: wazir-5.0.4-build-log
           path: build.log
           if-no-files-found: ignore
           retention-days: 14

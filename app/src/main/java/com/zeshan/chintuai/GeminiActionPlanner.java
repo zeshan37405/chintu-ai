@@ -53,8 +53,8 @@ public final class GeminiActionPlanner {
         try {
             connection = (HttpURLConnection) new URL(ENDPOINT).openConnection();
             connection.setRequestMethod("POST");
-            connection.setConnectTimeout(15_000);
-            connection.setReadTimeout(35_000);
+            connection.setConnectTimeout(10_000);
+            connection.setReadTimeout(15_000);
             connection.setDoOutput(true);
             connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
             connection.setRequestProperty("Accept", "application/json");
@@ -80,7 +80,7 @@ public final class GeminiActionPlanner {
         }
     }
 
-    private static JSONObject buildRequest(String prompt) throws JSONException {
+    static JSONObject buildRequest(String prompt) throws JSONException {
         JSONObject request = new JSONObject();
         request.put("systemInstruction", new JSONObject()
                 .put("parts", new JSONArray().put(
@@ -161,7 +161,8 @@ public final class GeminiActionPlanner {
                                 new JSONArray().put("plan_phone_actions"))));
         request.put("generationConfig", new JSONObject()
                 .put("temperature", 0.2)
-                .put("maxOutputTokens", 1200)
+                .put("maxOutputTokens", 800)
+                .put("thinkingConfig", new JSONObject().put("thinkingBudget", 0))
                 .put("candidateCount", 1));
         return request;
     }

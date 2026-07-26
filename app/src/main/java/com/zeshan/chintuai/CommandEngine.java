@@ -325,13 +325,18 @@ public final class CommandEngine {
     }
 
     public static boolean hasWakeWord(String raw) {
-        String text = normalize(raw);
-        return text.startsWith("چنٹو") || text.startsWith("چنتو")
+        String text = normalize(AccentCommandNormalizer.canonicalize(raw));
+        return WazirWakeWord.startsWithWakeWord(text)
+                || text.startsWith("چنٹو") || text.startsWith("چنتو")
                 || text.startsWith("chintu");
     }
 
     public static String stripWakeWord(String raw) {
-        String text = normalize(raw);
+        String canonical = AccentCommandNormalizer.canonicalize(raw);
+        if (WazirWakeWord.startsWithWakeWord(canonical)) {
+            return normalize(WazirWakeWord.strip(canonical));
+        }
+        String text = normalize(canonical);
         return text
                 .replaceFirst("^(چنٹو|چنتو|chintu)(\\s+جی|\\s+سنو|\\s+بھائی)?\\s*", "")
                 .trim();

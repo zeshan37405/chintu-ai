@@ -34,6 +34,13 @@ public final class GeminiLiveProtocolTest {
                 setup.getString("model"));
         assertTrue(setup.has("inputAudioTranscription"));
         assertTrue(setup.has("realtimeInputConfig"));
+        JSONObject vad = setup.getJSONObject("realtimeInputConfig")
+                .getJSONObject("automaticActivityDetection");
+        assertEquals("END_SENSITIVITY_HIGH",
+                vad.getString("endOfSpeechSensitivity"));
+        assertEquals(900, vad.getInt("silenceDurationMs"));
+        assertTrue(setup.getJSONObject("systemInstruction").toString()
+                .contains("Perso-Arabic"));
     }
 
     @Test
