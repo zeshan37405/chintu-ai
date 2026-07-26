@@ -440,4 +440,4 @@ public final class ChintuAccessibilityService extends AccessibilityService {
     private interface ServiceAction {
         boolean run(ChintuAccessibilityService service);
     }
-}
+    }
