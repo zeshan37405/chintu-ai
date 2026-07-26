@@ -33,20 +33,24 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
 import okhttp3.WebSocket;
 import okhttp3.WebSocketListener;
+import okio.ByteString;
 
 /**
- * Wazir Gen Z 5.0.1 transcript-first Gemini Live voice service.
+ * Wazir Gen Z transcript-first Gemini Live voice service.
  *
  * A WebSocket TCP upgrade is not called "connected" anymore. The microphone starts only after an
- * actual setupComplete server message. Server JSON errors and WebSocket close codes are surfaced to
- * the screen. Live performs continuous transcription; the existing Gemini REST brain converts the
- * finished transcript into safe Android actions. This keeps the fragile Live handshake minimal.
+ * actual setupComplete server message, whether Gemini sends it in a text or binary WebSocket frame.
+ * Server JSON errors and WebSocket close codes are surfaced to the screen. Live performs continuous
+ * transcription; the existing Gemini REST brain converts the finished transcript into safe Android
+ * actions. Each connection generation can fail only once so cancelling an old socket cannot skip a
+ * fallback model or stop a newer session.
  */
 public final class GeminiLiveVoiceService extends Service {
     public static final String ACTION_START_HANDS_FREE =
@@ -101,7 +105,7 @@ public final class GeminiLiveVoiceService extends Service {
     private volatile boolean commandRunning;
     private volatile boolean audioStreamEnded;
 
-    private int generation;
+    private final AtomicInteger generation = new AtomicInteger();
     private int modelIndex;
     private int reconnectAttempt;
     private String activeModel = GeminiLiveProtocol.modelAt(0);
@@ -185,7 +189,7 @@ public final class GeminiLiveVoiceService extends Service {
 
     private void connect() {
         if (!active || manualStop) return;
-        int ticket = ++generation;
+        int ticket = generation.incrementAndGet();
         clearSessionTimers();
         stopAudioCapture();
         closeSocket();
@@ -217,7 +221,7 @@ public final class GeminiLiveVoiceService extends Service {
         socket = client.newWebSocket(request, new WebSocketListener() {
             @Override
             public void onOpen(WebSocket webSocket, Response response) {
-                if (ticket != generation || manualStop) {
+                if (ticket != generation.get() || manualStop) {
                     webSocket.close(1000, "stale");
                     return;
                 }
@@ -225,6 +229,7 @@ public final class GeminiLiveVoiceService extends Service {
                     boolean sent = webSocket.send(
                             GeminiLiveProtocol.setupMessage(directMode, activeModel));
                     main.post(() -> {
+                        if (ticket != generation.get() || manualStop) return;
                         if (!sent) {
                             handleConnectionFailure(ticket,
                                     "WebSocket کھلا مگر setup message send نہیں ہوئی");
@@ -242,6 +247,12 @@ public final class GeminiLiveVoiceService extends Service {
 
             @Override
             public void onMessage(WebSocket webSocket, String text) {
+                main.post(() -> handleMessage(ticket, text));
+            }
+
+            @Override
+            public void onMessage(WebSocket webSocket, ByteString bytes) {
+                String text = GeminiLiveProtocol.serverMessageText(bytes);
                 main.post(() -> handleMessage(ticket, text));
             }
 
@@ -276,7 +287,7 @@ public final class GeminiLiveVoiceService extends Service {
         });
 
         setupWatchdog = () -> {
-            if (ticket != generation || setupComplete || manualStop) return;
+            if (ticket != generation.get() || setupComplete || manualStop) return;
             handleConnectionFailure(ticket,
                     "20 سیکنڈ میں setupComplete نہیں آیا");
         };
@@ -284,7 +295,7 @@ public final class GeminiLiveVoiceService extends Service {
     }
 
     private void handleMessage(int ticket, String text) {
-        if (ticket != generation || manualStop || text == null || text.isEmpty()) return;
+        if (ticket != generation.get() || manualStop || text == null || text.isEmpty()) return;
         try {
             JSONObject root = new JSONObject(text);
             String apiError = GeminiLiveProtocol.errorSummary(root);
@@ -296,7 +307,7 @@ public final class GeminiLiveVoiceService extends Service {
                 setupComplete = true;
                 reconnectAttempt = 0;
                 removeSetupWatchdog();
-                startAudioCapture();
+                startAudioCapture(ticket);
                 broadcastStatus(directMode ? "فوری Live Voice سن رہا ہے" : "وزیر Live تیار ہے",
                         directMode
                                 ? "پوری کمانڈ بولیں؛ 45 سیکنڈ کی window ہے"
@@ -412,7 +423,7 @@ public final class GeminiLiveVoiceService extends Service {
                 "کہیں: وزیر، پھر پوری کمانڈ", false);
     }
 
-    private void startAudioCapture() {
+    private void startAudioCapture(int ticket) {
         if (recording || manualStop || !setupComplete) return;
         int min = AudioRecord.getMinBufferSize(
                 GeminiLiveProtocol.INPUT_SAMPLE_RATE,
@@ -428,7 +439,7 @@ public final class GeminiLiveVoiceService extends Service {
         }
         if (value == null || value.getState() != AudioRecord.STATE_INITIALIZED) {
             if (value != null) value.release();
-            handleConnectionFailure(generation,
+            handleConnectionFailure(ticket,
                     "AudioRecord شروع نہیں ہوا؛ دوسری microphone app بند کریں");
             return;
         }
@@ -436,7 +447,7 @@ public final class GeminiLiveVoiceService extends Service {
         recorder = value;
         enableAudioEffects(value.getAudioSessionId());
         recording = true;
-        audioThread = new Thread(this::audioLoop, "Wazir-Live-PCM");
+        audioThread = new Thread(() -> audioLoop(ticket), "Wazir-Live-PCM");
         audioThread.setPriority(Thread.MAX_PRIORITY);
         audioThread.start();
     }
@@ -457,7 +468,7 @@ public final class GeminiLiveVoiceService extends Service {
         }
     }
 
-    private void audioLoop() {
+    private void audioLoop(int ticket) {
         AudioRecord value = recorder;
         if (value == null) return;
         byte[] buffer = new byte[3_200];
@@ -472,14 +483,14 @@ public final class GeminiLiveVoiceService extends Service {
                 if (current == null) continue;
                 try {
                     if (!current.send(GeminiLiveProtocol.audioMessage(buffer, read))) {
-                        main.post(() -> handleConnectionFailure(generation,
+                        main.post(() -> handleConnectionFailure(ticket,
                                 "Live audio send queue بند ہوئی"));
                     }
                 } catch (JSONException ignored) {
                 }
             }
         } catch (RuntimeException error) {
-            main.post(() -> handleConnectionFailure(generation,
+            main.post(() -> handleConnectionFailure(ticket,
                     "Microphone stream: " + error.getClass().getSimpleName()));
         }
     }
@@ -497,7 +508,7 @@ public final class GeminiLiveVoiceService extends Service {
     }
 
     private void handleConnectionFailure(int ticket, String reason) {
-        if (ticket != generation || manualStop || !active) return;
+        if (manualStop || !active || !generation.compareAndSet(ticket, ticket + 1)) return;
         boolean failedBeforeSetup = !setupComplete;
         setupComplete = false;
         stopAudioCapture();
@@ -517,7 +528,12 @@ public final class GeminiLiveVoiceService extends Service {
         broadcastStatus("Gemini Live setup ناکام",
                 detail, true);
         if (directMode) {
-            main.postDelayed(() -> stopLive("Live setup ناکام: " + detail), 4_000L);
+            int failedGeneration = generation.get();
+            main.postDelayed(() -> {
+                if (generation.get() == failedGeneration && active && directMode) {
+                    stopLive("Live setup ناکام: " + detail);
+                }
+            }, 4_000L);
             return;
         }
         modelIndex = 0;
@@ -719,7 +735,7 @@ public final class GeminiLiveVoiceService extends Service {
     private void stopLive(String message) {
         active = false;
         manualStop = true;
-        generation++;
+        generation.incrementAndGet();
         clearSessionTimers();
         stopAudioCapture();
         closeSocket();
@@ -765,7 +781,7 @@ public final class GeminiLiveVoiceService extends Service {
     public void onDestroy() {
         active = false;
         manualStop = true;
-        generation++;
+        generation.incrementAndGet();
         clearSessionTimers();
         stopAudioCapture();
         closeSocket();
