@@ -42,9 +42,15 @@ public final class AppCatalog {
         AppSpec best = null;
         int bestScore = 0;
         for (AppSpec app : APPS) {
-            int score = scoreName(target, normalizeAppKey(app.displayName));
+            String displayKey = normalizeAppKey(app.displayName);
+            int score = Math.max(
+                    scoreName(target, displayKey),
+                    containedAliasScore(target, displayKey));
             for (String alias : app.aliases) {
-                score = Math.max(score, scoreName(target, normalizeAppKey(alias)));
+                String aliasKey = normalizeAppKey(alias);
+                score = Math.max(score, Math.max(
+                        scoreName(target, aliasKey),
+                        containedAliasScore(target, aliasKey)));
             }
             if (score > bestScore) {
                 best = app;
@@ -116,6 +122,11 @@ public final class AppCatalog {
         return source;
     }
 
+    private static int containedAliasScore(String request, String alias) {
+        if (request.isEmpty() || alias.isEmpty()) return 0;
+        return (" " + request + " ").contains(" " + alias + " ") ? 97 : 0;
+    }
+
     private static List<AppSpec> buildApps() {
         List<AppSpec> apps = new ArrayList<>();
         apps.add(spec("YouTube", "https://www.youtube.com",
@@ -136,7 +147,7 @@ public final class AppCatalog {
                 packages("com.facebook.lite"),
                 aliases("فیس بک لائٹ", "फेसबुक लाइट", "facebook lite")));
         apps.add(spec("Facebook", "https://www.facebook.com",
-                packages("com.facebook.katana"),
+                packages("com.facebook.katana", "com.facebook.lite"),
                 aliases("فیس بک", "فیسبک", "फेसबुक", "facebook", "face book")));
         apps.add(spec("Messenger", "https://www.messenger.com",
                 packages("com.facebook.orca"),
