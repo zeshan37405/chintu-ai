@@ -8,6 +8,8 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 import org.junit.Test;
 
+import okio.ByteString;
+
 public final class GeminiLiveProtocolTest {
     @Test
     public void responseModalitiesLivesInsideGenerationConfig() throws Exception {
@@ -32,5 +34,14 @@ public final class GeminiLiveProtocolTest {
                 setup.getString("model"));
         assertTrue(setup.has("inputAudioTranscription"));
         assertTrue(setup.has("realtimeInputConfig"));
+    }
+
+    @Test
+    public void binarySetupCompleteFrameDecodesAsUtf8Json() throws Exception {
+        ByteString frame = ByteString.encodeUtf8("{\"setupComplete\":{}}");
+
+        JSONObject root = new JSONObject(GeminiLiveProtocol.serverMessageText(frame));
+
+        assertTrue(root.has("setupComplete"));
     }
 }
