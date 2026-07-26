@@ -4,6 +4,8 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import okio.ByteString;
+
 /** Builds and parses the raw Gemini Live WebSocket messages used by Wazir. */
 public final class GeminiLiveProtocol {
     /** Current Live model, followed by the older native-audio fallback model. */
@@ -70,6 +72,14 @@ public final class GeminiLiveProtocol {
     public static String audioStreamEndMessage() throws JSONException {
         return new JSONObject().put("realtimeInput",
                 new JSONObject().put("audioStreamEnd", true)).toString();
+    }
+
+    /**
+     * Gemini Live can deliver JSON server events as binary WebSocket frames. OkHttp routes those
+     * frames to WebSocketListener.onMessage(WebSocket, ByteString), not the String overload.
+     */
+    public static String serverMessageText(ByteString bytes) {
+        return bytes == null ? "" : bytes.utf8();
     }
 
     public static String errorSummary(JSONObject root) {
